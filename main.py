@@ -5,7 +5,7 @@ import time
 from aiohttp import web
 from dotenv import load_dotenv
 
-from birdeye import Birdeye, normalize_large_trade
+from birdeye import Birdeye, normalize_smart_money
 from exchanges import ExchangeValidator
 from telegram import Telegram
 
