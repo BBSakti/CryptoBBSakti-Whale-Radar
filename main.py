@@ -21,14 +21,16 @@ MIN_FUT_DOM = float(os.getenv("MIN_FUT_DOMINANCE", "0.74"))
 MAX_PUMP = float(os.getenv("MAX_24H_PUMP_PCT", "15"))
 MIN_FUT_SCORE = int(os.getenv("MIN_FUT_SCORE", "5"))
 DEDUP_TTL = int(os.getenv("DEDUP_TTL_SECONDS", "10800"))
-SPOT_FLOW_BUDGET = int(os.getenv("SPOT_FLOW_BUDGET", "60"))
-FUTURES_BUDGET = int(os.getenv("FUTURES_BUDGET", "120"))
+SPOT_FLOW_BUDGET = int(os.getenv("SPOT_FLOW_BUDGET", "35"))
+FUTURES_BUDGET = int(os.getenv("FUTURES_BUDGET", "80"))
 CYCLE_SLEEP = int(os.getenv("CYCLE_SLEEP_SECONDS", "20"))
 
 tg = Telegram(TOKEN, CHAT)
 seen = {}
 spot_cursor = 0
 futures_cursor = 0
+previous_spot = {}
+previous_futures = {}
 
 
 def f(v, d=0.0):
@@ -434,6 +436,46 @@ async def scan_futures(session, ticker):
     return await send_once("futures", sym, side, strength, msg)
 
 
+
+def anomaly_rank(items, previous, budget):
+    """ Stage 1 is market-wide and cheap: every ticker returned by Bitget is evaluated. It ranks symbols by turnover acceleration, absolute price movement and liquidity. Stage 2 then spends expensive API calls only on the strongest anomalies. """
+    ranked = []
+    current = {}
+
+    for x in items:
+        sym = x["symbol"]
+        current[sym] = (x["price"], x["turnover"])
+        old = previous.get(sym)
+
+        turnover_accel = 1.0
+        short_move = 0.0
+        if old:
+            old_price, old_turn = old
+            if old_turn > 0:
+                turnover_accel = max(x["turnover"] / old_turn, 0.0)
+            if old_price > 0:
+                short_move = abs((x["price"] / old_price - 1.0) * 100)
+
+        # First cycle has no baseline. Liquidity and 24h displacement provide
+        # the initial ranking; subsequent cycles add real short-term acceleration.
+        accel_component = min(max(turnover_accel - 1.0, 0.0) * 25.0, 25.0)
+        move_component = min(short_move * 8.0, 25.0)
+        day_component = min(abs(x["change"]) * 0.8, 20.0)
+        liquidity_component = min(max(__import__("math").log10(max(x["turnover"], 1)) - 5, 0) * 5, 15.0)
+        score = accel_component + move_component + day_component + liquidity_component
+
+        y = dict(x)
+        y["stage1_score"] = score
+        y["turnover_accel"] = turnover_accel
+        y["short_move"] = short_move
+        ranked.append(y)
+
+    previous.clear()
+    previous.update(current)
+    ranked.sort(key=lambda z: z["stage1_score"], reverse=True)
+    return ranked[:min(budget, len(ranked))], len(ranked)
+
+
 def batch(items, cursor, budget):
     if not items:
         return [], 0
@@ -444,13 +486,13 @@ def batch(items, cursor, budget):
 
 
 async def radar_loop():
-    global spot_cursor, futures_cursor
+    global spot_cursor, futures_cursor, previous_spot, previous_futures
 
     timeout = aiohttp.ClientTimeout(total=20)
     connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        print("🐋 CryptoBBSakti ALL-MARKET Radar V300 starting...")
+        print("🐋 CryptoBBSakti ALL-MARKET Radar V400 starting...")
 
         while True:
             started = time.time()
@@ -460,17 +502,24 @@ async def radar_loop():
                     futures_universe(session),
                 )
 
-                spot_jobs, spot_cursor = batch(spots, spot_cursor, SPOT_FLOW_BUDGET)
-                fut_jobs, futures_cursor = batch(futures, futures_cursor, FUTURES_BUDGET)
+                # STAGE 1: ALL returned USDT tickers are scored every cycle.
+                spot_jobs, spot_stage1 = anomaly_rank(
+                    spots, previous_spot, SPOT_FLOW_BUDGET
+                )
+                fut_jobs, fut_stage1 = anomaly_rank(
+                    futures, previous_futures, FUTURES_BUDGET
+                )
 
                 spot_alerts = fut_alerts = 0
 
+                # STAGE 2 SPOT: expensive whale-flow only for strongest anomalies.
                 for t in spot_jobs:
                     try:
                         spot_alerts += int(await scan_spot(session, t))
                     except Exception as e:
                         print(f"SPOT ERROR | {t['symbol']} | {repr(e)}")
 
+                # STAGE 2 FUTURES: multi-confirmation analysis for ranked anomalies.
                 sem = asyncio.Semaphore(8)
 
                 async def fut_worker(t):
@@ -482,16 +531,22 @@ async def radar_loop():
                             return 0
 
                 if fut_jobs:
-                    fut_alerts = sum(await asyncio.gather(*(fut_worker(t) for t in fut_jobs)))
+                    fut_alerts = sum(
+                        await asyncio.gather(*(fut_worker(t) for t in fut_jobs))
+                    )
+
+                top_spot = ",".join(x["symbol"] for x in spot_jobs[:3]) or "-"
+                top_fut = ",".join(x["symbol"] for x in fut_jobs[:3]) or "-"
 
                 print(
-                    f"RADAR V300 OK | SPOT universe={len(spots)} scanned={len(spot_jobs)} "
-                    f"alerts={spot_alerts} | FUTURES universe={len(futures)} "
-                    f"scanned={len(fut_jobs)} alerts={fut_alerts} | "
-                    f"{time.time()-started:.0f}s"
+                    f"RADAR V400 OK | "
+                    f"SPOT stage1={spot_stage1} deep={len(spot_jobs)} alerts={spot_alerts} "
+                    f"top={top_spot} | "
+                    f"FUTURES stage1={fut_stage1} deep={len(fut_jobs)} alerts={fut_alerts} "
+                    f"top={top_fut} | {time.time()-started:.0f}s"
                 )
             except Exception as e:
-                print(f"RADAR V300 ERROR | {repr(e)}")
+                print(f"RADAR V400 ERROR | {repr(e)}")
 
             await asyncio.sleep(CYCLE_SLEEP)
 
@@ -500,7 +555,7 @@ async def health(_):
     return web.json_response({
         "ok": True,
         "service": "CryptoBBSakti ALL-MARKET Radar",
-        "version": "V300",
+        "version": "V400",
         "scope": "ALL Bitget USDT SPOT + USDT FUTURES",
         "dedup": len(seen),
         "time": int(time.time()),
@@ -521,12 +576,13 @@ async def main():
     await start_health()
     try:
         await tg.send(
-            "🐋 <b>CryptoBBSakti ALL-MARKET Radar V300 ONLINE</b>\n\n"
+            "🐋 <b>CryptoBBSakti ALL-MARKET Radar V400 ONLINE</b>\n\n"
             "✅ ALL Bitget USDT SPOT coins\n"
             "✅ ALL Bitget USDT FUTURES coins\n"
             "✅ BTC & ETH INCLUDED\n"
             "🚫 No priority coin whitelist\n"
-            "🔄 Rotating market-wide scan\n"
+            "⚡ Stage 1 scans ALL tickers every cycle\n"
+            "🔬 Stage 2 deep-scans strongest anomalies\n"
             "📡 Analysis-only mode."
         )
     except Exception as e:
