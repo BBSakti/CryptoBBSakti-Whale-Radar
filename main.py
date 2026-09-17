@@ -17,8 +17,9 @@ BASE = "https://api.bitget.com"
 MIN_SPOT_TURNOVER = float(os.getenv("MIN_SPOT_TURNOVER", "100000"))
 MIN_FUT_TURNOVER = float(os.getenv("MIN_FUT_TURNOVER", "500000"))
 MIN_SPOT_DOM = float(os.getenv("MIN_SPOT_DOMINANCE", "0.68"))
-MIN_FUT_DOM = float(os.getenv("MIN_FUT_DOMINANCE", "0.68"))
+MIN_FUT_DOM = float(os.getenv("MIN_FUT_DOMINANCE", "0.74"))
 MAX_PUMP = float(os.getenv("MAX_24H_PUMP_PCT", "15"))
+MIN_FUT_SCORE = int(os.getenv("MIN_FUT_SCORE", "5"))
 DEDUP_TTL = int(os.getenv("DEDUP_TTL_SECONDS", "10800"))
 SPOT_FLOW_BUDGET = int(os.getenv("SPOT_FLOW_BUDGET", "60"))
 FUTURES_BUDGET = int(os.getenv("FUTURES_BUDGET", "120"))
@@ -176,6 +177,56 @@ async def spot_book(session, symbol):
     return None if total <= 0 else (bid / total, ask / total)
 
 
+async def futures_candles(session, symbol):
+    p = await get_json(
+        session, "/api/v3/market/candles",
+        {
+            "category": "USDT-FUTURES",
+            "symbol": symbol,
+            "interval": "15m",
+            "limit": "24",
+            "type": "market",
+        }, True
+    )
+    if not p:
+        return None
+    rows = p.get("data") or []
+    if len(rows) < 8:
+        return None
+    try:
+        rows = sorted(rows, key=lambda z: int(z[0]))
+        closes = [f(z[4]) for z in rows]
+        highs = [f(z[2]) for z in rows]
+        lows = [f(z[3]) for z in rows]
+        vols = [f(z[6]) for z in rows]
+        if min(closes) <= 0:
+            return None
+
+        recent = rows[-1]
+        prev = rows[-2]
+        recent_vol = f(recent[6])
+        baseline = sum(vols[-7:-1]) / max(len(vols[-7:-1]), 1)
+        vol_ratio = recent_vol / baseline if baseline > 0 else 0.0
+
+        prev_high = max(highs[-7:-1])
+        prev_low = min(lows[-7:-1])
+        close = closes[-1]
+        breakout = close > prev_high
+        breakdown = close < prev_low
+
+        ret15 = (closes[-1] / closes[-2] - 1) * 100
+        ret60 = (closes[-1] / closes[-5] - 1) * 100 if len(closes) >= 5 else 0.0
+        return {
+            "vol_ratio": vol_ratio,
+            "breakout": breakout,
+            "breakdown": breakdown,
+            "ret15": ret15,
+            "ret60": ret60,
+        }
+    except Exception:
+        return None
+
+
 async def futures_fills(session, symbol):
     p = await get_json(
         session, "/api/v2/mix/market/fills",
@@ -294,8 +345,13 @@ async def scan_spot(session, ticker):
 
 async def scan_futures(session, ticker):
     sym = ticker["symbol"]
-    fills = await futures_fills(session, sym)
-    if not fills:
+
+    fills, candles, book = await asyncio.gather(
+        futures_fills(session, sym),
+        futures_candles(session, sym),
+        futures_book(session, sym),
+    )
+    if not fills or not candles:
         return False
 
     buy, sell, buy_dom, sell_dom = fills
@@ -304,44 +360,76 @@ async def scan_futures(session, ticker):
     if dom < MIN_FUT_DOM:
         return False
 
+    # Long/short is intentionally queried only after the cheap quality gates.
+    # Official endpoint is limited to 1 request/sec/IP.
     ls = await futures_long_short(session, sym)
     await asyncio.sleep(1.02)
-    book = await futures_book(session, sym)
 
     book_text = "N/A"
     book_confirm = False
     if book:
         bid_r, ask_r = book
         book_text = f"BID {bid_r:.0%} / ASK {ask_r:.0%}"
-        book_confirm = bid_r >= 0.55 if side == "LONG" else ask_r >= 0.55
+        book_confirm = bid_r >= 0.57 if side == "LONG" else ask_r >= 0.57
 
     ls_text = "N/A"
     ls_confirm = False
     if ls:
         lr, sr, ratio = ls
         ls_text = f"L {lr:.1%} / S {sr:.1%} / L:S {ratio:.2f}"
-        ls_confirm = ratio >= 1.05 if side == "LONG" else (ratio > 0 and ratio <= 0.95)
+        # Long/short is confirmation only, never a standalone trigger.
+        ls_confirm = ratio >= 1.08 if side == "LONG" else (ratio > 0 and ratio <= 0.92)
 
-    flow_total = buy + sell
-    strength = dom + (0.1 if book_confirm else 0) + (0.1 if ls_confirm else 0)
+    vol_confirm = candles["vol_ratio"] >= 1.35
+    structure_confirm = candles["breakout"] if side == "LONG" else candles["breakdown"]
+    momentum_confirm = (
+        candles["ret15"] > 0 and candles["ret60"] > 0
+        if side == "LONG"
+        else candles["ret15"] < 0 and candles["ret60"] < 0
+    )
 
-    if not (book_confirm or ls_confirm):
+    # Avoid chasing already extended long moves.
+    if side == "LONG" and ticker["change"] > MAX_PUMP:
         return False
 
+    score = 0
+    score += 2 if dom >= 0.80 else 1
+    score += 1 if vol_confirm else 0
+    score += 2 if structure_confirm else 0
+    score += 1 if momentum_confirm else 0
+    score += 1 if book_confirm else 0
+    score += 1 if ls_confirm else 0
+
+    # A valid alert must have actual volume expansion plus either
+    # structure confirmation or at least two independent confirmations.
+    independent = sum([momentum_confirm, book_confirm, ls_confirm])
+    if score < MIN_FUT_SCORE:
+        return False
+    if not vol_confirm:
+        return False
+    if not structure_confirm and independent < 2:
+        return False
+
+    flow_total = buy + sell
+    strength = score + dom
+
     msg = (
-        f"{'🔵' if side == 'LONG' else '🔴'} <b>FUTURES {side} SETUP</b>\n\n"
+        f"{'🔵' if side == 'LONG' else '🔴'} <b>FUTURES {side} HIGH-CONVICTION</b>\n\n"
         f"🪙 <b>{sym}</b>\n"
         f"💵 Price: ${ticker['price']:.8g}\n"
         f"📊 24H: {ticker['change']:+.2f}%\n"
         f"🔥 Futures turnover: {usd(ticker['turnover'])}\n"
-        f"⚡ Recent trade dominance: <b>{dom:.1%}</b>\n"
-        f"💰 Sampled fills: {usd(flow_total)}\n"
+        f"⚡ Aggressive trade dominance: <b>{dom:.1%}</b>\n"
+        f"🌋 15m volume spike: <b>{candles['vol_ratio']:.2f}x</b>\n"
+        f"🧭 15m / 60m: {candles['ret15']:+.2f}% / {candles['ret60']:+.2f}%\n"
+        f"🧱 Structure: <b>{'BREAKOUT' if candles['breakout'] else 'BREAKDOWN' if candles['breakdown'] else 'RANGE'}</b>\n"
         f"📚 Order book: {book_text}\n"
         f"⚖️ Long/Short: {ls_text}\n"
         f"💸 Funding: {ticker['funding']:.6f}\n"
-        f"📦 OI: {ticker['oi']:.4g}\n"
+        f"📦 OI snapshot: {ticker['oi']:.4g}\n"
+        f"🎯 Quality score: <b>{score}/8</b>\n"
         f"📡 Bias: <b>{side}</b>\n\n"
-        f"ℹ️ Futures signal, bukan eksekusi trade."
+        f"ℹ️ Multi-confirmation futures signal. Analysis-only."
     )
     return await send_once("futures", sym, side, strength, msg)
 
@@ -362,7 +450,7 @@ async def radar_loop():
     connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        print("🐋 CryptoBBSakti ALL-MARKET Radar V200 starting...")
+        print("🐋 CryptoBBSakti ALL-MARKET Radar V300 starting...")
 
         while True:
             started = time.time()
@@ -397,13 +485,13 @@ async def radar_loop():
                     fut_alerts = sum(await asyncio.gather(*(fut_worker(t) for t in fut_jobs)))
 
                 print(
-                    f"RADAR V200 OK | SPOT universe={len(spots)} scanned={len(spot_jobs)} "
+                    f"RADAR V300 OK | SPOT universe={len(spots)} scanned={len(spot_jobs)} "
                     f"alerts={spot_alerts} | FUTURES universe={len(futures)} "
                     f"scanned={len(fut_jobs)} alerts={fut_alerts} | "
                     f"{time.time()-started:.0f}s"
                 )
             except Exception as e:
-                print(f"RADAR V200 ERROR | {repr(e)}")
+                print(f"RADAR V300 ERROR | {repr(e)}")
 
             await asyncio.sleep(CYCLE_SLEEP)
 
@@ -412,7 +500,7 @@ async def health(_):
     return web.json_response({
         "ok": True,
         "service": "CryptoBBSakti ALL-MARKET Radar",
-        "version": "V200",
+        "version": "V300",
         "scope": "ALL Bitget USDT SPOT + USDT FUTURES",
         "dedup": len(seen),
         "time": int(time.time()),
@@ -433,7 +521,7 @@ async def main():
     await start_health()
     try:
         await tg.send(
-            "🐋 <b>CryptoBBSakti ALL-MARKET Radar V200 ONLINE</b>\n\n"
+            "🐋 <b>CryptoBBSakti ALL-MARKET Radar V300 ONLINE</b>\n\n"
             "✅ ALL Bitget USDT SPOT coins\n"
             "✅ ALL Bitget USDT FUTURES coins\n"
             "✅ BTC & ETH INCLUDED\n"
