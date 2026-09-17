@@ -187,27 +187,33 @@ async def futures_candles(session, symbol):
             "category": "USDT-FUTURES",
             "symbol": symbol,
             "interval": "15m",
-            "limit": "24",
+            "limit": "60",
             "type": "market",
         }, True
     )
     if not p:
         return None
     rows = p.get("data") or []
-    if len(rows) < 8:
+    if len(rows) < 24:
         return None
     try:
         rows = sorted(rows, key=lambda z: int(z[0]))
-        closes = [f(z[4]) for z in rows]
+        opens = [f(z[1]) for z in rows]
         highs = [f(z[2]) for z in rows]
         lows = [f(z[3]) for z in rows]
+        closes = [f(z[4]) for z in rows]
         vols = [f(z[6]) for z in rows]
         if min(closes) <= 0:
             return None
 
-        recent = rows[-1]
-        prev = rows[-2]
-        recent_vol = f(recent[6])
+        def ema(values, period):
+            k = 2.0 / (period + 1.0)
+            out = values[0]
+            for value in values[1:]:
+                out = value * k + out * (1.0 - k)
+            return out
+
+        recent_vol = vols[-1]
         baseline = sum(vols[-7:-1]) / max(len(vols[-7:-1]), 1)
         vol_ratio = recent_vol / baseline if baseline > 0 else 0.0
 
@@ -216,28 +222,65 @@ async def futures_candles(session, symbol):
         close = closes[-1]
         breakout = close > prev_high
         breakdown = close < prev_low
-
         ret15 = (closes[-1] / closes[-2] - 1) * 100
-        ret60 = (closes[-1] / closes[-5] - 1) * 100 if len(closes) >= 5 else 0.0
+        ret60 = (closes[-1] / closes[-5] - 1) * 100
 
-        # ATR sederhana 14 candle untuk level risiko dinamis.
         trs = []
         for i in range(1, len(rows)):
-            h = highs[i]
-            l = lows[i]
-            pc = closes[i - 1]
-            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+            trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1])))
         atr14 = sum(trs[-14:]) / max(len(trs[-14:]), 1)
 
+        ema9 = ema(closes[-40:], 9)
+        ema21 = ema(closes[-50:], 21)
+        trend_up = close > ema9 > ema21
+        trend_down = close < ema9 < ema21
+
+        gains = []
+        losses = []
+        for i in range(-14, 0):
+            delta = closes[i] - closes[i-1]
+            gains.append(max(delta, 0.0))
+            losses.append(max(-delta, 0.0))
+        avg_gain = sum(gains) / 14.0
+        avg_loss = sum(losses) / 14.0
+        rsi14 = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
+
+        support = min(lows[-13:-1])
+        resistance = max(highs[-13:-1])
+        swing_low = min(lows[-5:])
+        swing_high = max(highs[-5:])
+
+        o1, h1, l1, c1 = opens[-1], highs[-1], lows[-1], closes[-1]
+        o0, c0 = opens[-2], closes[-2]
+        body = abs(c1 - o1)
+        rng = max(h1 - l1, 1e-18)
+        lower_wick = min(o1, c1) - l1
+        upper_wick = h1 - max(o1, c1)
+        bullish_engulf = c1 > o1 and c0 < o0 and c1 >= o0 and o1 <= c0
+        bearish_engulf = c1 < o1 and c0 > o0 and o1 >= c0 and c1 <= o0
+        hammer = lower_wick >= max(body * 2.0, rng * 0.45) and upper_wick <= rng * 0.25
+        shooting_star = upper_wick >= max(body * 2.0, rng * 0.45) and lower_wick <= rng * 0.25
+        if bullish_engulf:
+            pattern = "BULLISH ENGULFING"
+        elif bearish_engulf:
+            pattern = "BEARISH ENGULFING"
+        elif hammer:
+            pattern = "HAMMER"
+        elif shooting_star:
+            pattern = "SHOOTING STAR"
+        else:
+            pattern = "NETRAL"
+
         return {
-            "vol_ratio": vol_ratio,
-            "breakout": breakout,
-            "breakdown": breakdown,
-            "ret15": ret15,
-            "ret60": ret60,
-            "atr": atr14,
+            "vol_ratio": vol_ratio, "breakout": breakout, "breakdown": breakdown,
+            "ret15": ret15, "ret60": ret60, "atr": atr14,
+            "ema9": ema9, "ema21": ema21, "trend_up": trend_up, "trend_down": trend_down,
+            "rsi": rsi14, "support": support, "resistance": resistance,
+            "swing_low": swing_low, "swing_high": swing_high, "pattern": pattern,
+            "breakout_level": prev_high, "breakdown_level": prev_low,
         }
-    except Exception:
+    except Exception as e:
+        print(f"CANDLE ERROR | {symbol} | {repr(e)}")
         return None
 
 
@@ -400,11 +443,8 @@ async def scan_spot(session, ticker):
 
 async def scan_futures(session, ticker):
     sym = ticker["symbol"]
-
     fills, candles, book = await asyncio.gather(
-        futures_fills(session, sym),
-        futures_candles(session, sym),
-        futures_book(session, sym),
+        futures_fills(session, sym), futures_candles(session, sym), futures_book(session, sym)
     )
     if not fills or not candles:
         return False
@@ -415,8 +455,6 @@ async def scan_futures(session, ticker):
     if dom < MIN_FUT_DOM:
         return False
 
-    # Long/short is intentionally queried only after the cheap quality gates.
-    # Official endpoint is limited to 1 request/sec/IP.
     ls = await futures_long_short(session, sym)
     await asyncio.sleep(1.02)
 
@@ -432,18 +470,15 @@ async def scan_futures(session, ticker):
     if ls:
         lr, sr, ratio = ls
         ls_text = f"L {lr:.1%} / S {sr:.1%} / L:S {ratio:.2f}"
-        # Long/short is confirmation only, never a standalone trigger.
         ls_confirm = ratio >= 1.08 if side == "LONG" else (ratio > 0 and ratio <= 0.92)
 
     vol_confirm = candles["vol_ratio"] >= 1.35
     structure_confirm = candles["breakout"] if side == "LONG" else candles["breakdown"]
-    momentum_confirm = (
-        candles["ret15"] > 0 and candles["ret60"] > 0
-        if side == "LONG"
-        else candles["ret15"] < 0 and candles["ret60"] < 0
-    )
+    momentum_confirm = (candles["ret15"] > 0 and candles["ret60"] > 0) if side == "LONG" else (candles["ret15"] < 0 and candles["ret60"] < 0)
+    trend_confirm = candles["trend_up"] if side == "LONG" else candles["trend_down"]
+    rsi_confirm = (52 <= candles["rsi"] <= 78) if side == "LONG" else (22 <= candles["rsi"] <= 48)
+    candle_confirm = candles["pattern"] in ({"BULLISH ENGULFING", "HAMMER"} if side == "LONG" else {"BEARISH ENGULFING", "SHOOTING STAR"})
 
-    # Avoid chasing already extended long moves.
     if side == "LONG" and ticker["change"] > MAX_PUMP:
         return False
 
@@ -452,95 +487,99 @@ async def scan_futures(session, ticker):
     score += 1 if vol_confirm else 0
     score += 2 if structure_confirm else 0
     score += 1 if momentum_confirm else 0
+    score += 1 if trend_confirm else 0
+    score += 1 if rsi_confirm else 0
+    score += 1 if candle_confirm else 0
     score += 1 if book_confirm else 0
     score += 1 if ls_confirm else 0
 
-    # A valid alert must have actual volume expansion plus either
-    # structure confirmation or at least two independent confirmations.
-    independent = sum([momentum_confirm, book_confirm, ls_confirm])
-    if score < MIN_FUT_SCORE:
+    independent = sum([momentum_confirm, trend_confirm, rsi_confirm, candle_confirm, book_confirm, ls_confirm])
+    if score < max(MIN_FUT_SCORE, 6) or not vol_confirm:
         return False
-    if not vol_confirm:
-        return False
-    if not structure_confirm and independent < 2:
+    if not structure_confirm and independent < 4:
         return False
 
-    flow_total = buy + sell
+    if score >= 9:
+        fut_tier, fut_icon = "STRONG", "🔥"
+    elif score >= 7:
+        fut_tier, fut_icon = "CONFIRMED", "✅"
+    else:
+        return False
+
+    price = ticker["price"]
+    atr = candles.get("atr", 0.0) or price * 0.01
+    ema9 = candles["ema9"]
+
+    # V800: entry adalah zona retest berbasis struktur + EMA9 + ATR, bukan harga saat alert semata.
+    if side == "LONG":
+        anchor = candles["breakout_level"] if candles["breakout"] else ema9
+        anchor = min(anchor, price)
+        entry_low = max(0.0, anchor - 0.20 * atr)
+        entry_high = min(price, anchor + 0.20 * atr)
+        if entry_high < entry_low:
+            entry_high = entry_low
+        entry = (entry_low + entry_high) / 2.0
+        structural_sl = min(candles["swing_low"], candles["support"])
+        raw_risk = entry - (structural_sl - 0.20 * atr)
+        risk = min(max(raw_risk, 0.80 * atr, entry * 0.004), 2.50 * atr)
+        sl = max(0.0, entry - risk)
+        tp1, tp2, tp3 = entry + risk, entry + 2*risk, entry + 3*risk
+        chase = price > entry_high + 0.75 * atr
+    else:
+        anchor = candles["breakdown_level"] if candles["breakdown"] else ema9
+        anchor = max(anchor, price)
+        entry_low = max(price, anchor - 0.20 * atr)
+        entry_high = anchor + 0.20 * atr
+        entry = (entry_low + entry_high) / 2.0
+        structural_sl = max(candles["swing_high"], candles["resistance"])
+        raw_risk = (structural_sl + 0.20 * atr) - entry
+        risk = min(max(raw_risk, 0.80 * atr, entry * 0.004), 2.50 * atr)
+        sl = entry + risk
+        tp1, tp2, tp3 = max(0.0, entry-risk), max(0.0, entry-2*risk), max(0.0, entry-3*risk)
+        chase = price < entry_low - 0.75 * atr
+
+    risk_pct = abs(sl / entry - 1.0) * 100 if entry > 0 else 0.0
     strength = score + dom
 
-    if score >= 7:
-        fut_tier = "STRONG"
-        fut_icon = "🔥"
-    elif score >= 6:
-        fut_tier = "CONFIRMED"
-        fut_icon = "✅"
+    if chase:
+        fut_action = f"TUNGGU PULLBACK KE ZONA ENTRY, JANGAN KEJAR {side}"
+        entry_status = "HARGA SUDAH MENJAUH DARI ZONA IDEAL"
     else:
-        fut_tier = "WATCH"
-        fut_icon = "👀"
+        fut_action = f"PERTIMBANGKAN {side}" if fut_tier == "CONFIRMED" else f"KANDIDAT {side} KUAT"
+        entry_status = "HARGA MASIH DEKAT ZONA IDEAL"
 
-    # V700 hanya mengirim CONFIRMED atau STRONG.
-    if fut_tier == "WATCH":
-        return False
-
-    if side == "LONG":
-        fut_action = "PERTIMBANGKAN LONG" if fut_tier == "CONFIRMED" else "KANDIDAT LONG KUAT"
-        fut_meaning = "Tekanan transaksi dan konfirmasi teknikal condong naik. Tunggu entry yang disiplin, bukan mengejar candle."
-        fut_title = f"🔵 FUTURES: POTENSI LONG {fut_tier}"
-    else:
-        fut_action = "PERTIMBANGKAN SHORT" if fut_tier == "CONFIRMED" else "KANDIDAT SHORT KUAT"
-        fut_meaning = "Tekanan transaksi dan konfirmasi teknikal condong turun. Waspadai short squeeze dan invalidasi."
-        fut_title = f"🔴 FUTURES: POTENSI SHORT {fut_tier}"
-
-    # Level SL/TP berbasis ATR 15m, bukan persentase statis.
-    entry = ticker["price"]
-    atr = candles.get("atr", 0.0)
-    if atr <= 0:
-        atr = entry * 0.01
-
-    risk = max(atr * 1.25, entry * 0.004)
-    if side == "LONG":
-        sl = entry - risk
-        tp1 = entry + risk
-        tp2 = entry + risk * 2.0
-        tp3 = entry + risk * 3.0
-    else:
-        sl = entry + risk
-        tp1 = entry - risk
-        tp2 = entry - risk * 2.0
-        tp3 = entry - risk * 3.0
-
-    # Jangan tampilkan harga negatif pada aset berharga sangat kecil.
-    tp1 = max(tp1, 0.0)
-    tp2 = max(tp2, 0.0)
-    tp3 = max(tp3, 0.0)
-    risk_pct = abs(sl / entry - 1.0) * 100 if entry > 0 else 0.0
+    fut_title = f"{'🔵' if side == 'LONG' else '🔴'} FUTURES: POTENSI {side} {fut_tier}"
+    trend_text = "BULLISH" if candles["trend_up"] else "BEARISH" if candles["trend_down"] else "NETRAL"
+    structure_text = "BREAKOUT" if candles["breakout"] else "BREAKDOWN" if candles["breakdown"] else "RANGE"
 
     msg = (
         f"{fut_title}\n\n"
         f"🪙 <b>{sym}</b>\n"
-        f"💵 Harga: ${ticker['price']:.8g}\n"
+        f"💵 Harga sekarang: ${price:.8g}\n"
         f"📊 Perubahan 24J: {ticker['change']:+.2f}%\n"
         f"🔥 Turnover futures: {usd(ticker['turnover'])}\n"
         f"⚡ Dominasi transaksi agresif: <b>{dom:.1%}</b>\n"
         f"🌋 Lonjakan volume 15m: <b>{candles['vol_ratio']:.2f}x</b>\n"
-        f"🧭 15m / 60m: {candles['ret15']:+.2f}% / {candles['ret60']:+.2f}%\n"
-        f"🧱 Struktur: <b>{'BREAKOUT' if candles['breakout'] else 'BREAKDOWN' if candles['breakdown'] else 'RANGE'}</b>\n"
+        f"🧭 Momentum 15m / 60m: {candles['ret15']:+.2f}% / {candles['ret60']:+.2f}%\n"
+        f"🧱 Struktur: <b>{structure_text}</b>\n"
+        f"🕯 Pola candle: <b>{candles['pattern']}</b>\n"
+        f"📈 EMA9 / EMA21: ${candles['ema9']:.8g} / ${candles['ema21']:.8g} | {trend_text}\n"
+        f"📟 RSI14: <b>{candles['rsi']:.1f}</b>\n"
+        f"🧲 Support / Resistance: ${candles['support']:.8g} / ${candles['resistance']:.8g}\n"
         f"📚 Order book: {book_text}\n"
         f"⚖️ Long/Short: {ls_text}\n"
         f"💸 Funding rate: {ticker['funding']:.6f}\n"
         f"📦 Open Interest: {ticker['oi']:.4g}\n"
-        f"{fut_icon} Tingkat keyakinan: <b>{fut_tier}</b>\n"
-        f"🎯 Skor kualitas: <b>{score}/8</b>\n"
-        f"📡 Bias: <b>{side}</b>\n\n"
-        f"💰 <b>AREA ENTRY: ${entry:.8g}</b>\n"
-        f"🛑 <b>SL: ${sl:.8g}</b> ({risk_pct:.2f}% dari entry)\n"
+        f"{fut_icon} Keyakinan: <b>{fut_tier}</b> | skor <b>{score}/11</b>\n\n"
+        f"💰 <b>ZONA ENTRY: ${entry_low:.8g} - ${entry_high:.8g}</b>\n"
+        f"📍 Entry acuan: ${entry:.8g}\n"
+        f"🛑 <b>SL: ${sl:.8g}</b> ({risk_pct:.2f}% dari entry acuan)\n"
         f"🎯 <b>TP1: ${tp1:.8g}</b> | R:R 1:1\n"
         f"🎯 <b>TP2: ${tp2:.8g}</b> | R:R 1:2\n"
         f"🏆 <b>TP3: ${tp3:.8g}</b> | R:R 1:3\n"
-        f"📐 Level dihitung dinamis dari ATR 15m.\n\n"
+        f"🚦 Status entry: <b>{entry_status}</b>\n\n"
         f"🎯 <b>TINDAKAN: {fut_action}</b>\n"
-        f"📝 Arti: {fut_meaning}\n\n"
-        f"ℹ️ Sinyal futures multi-konfirmasi. Analisis saja, bukan eksekusi otomatis."
+        f"ℹ️ Level memakai struktur candle, swing, EMA9 dan ATR 15m. Analisis saja, bukan eksekusi otomatis."
     )
     return await send_once("futures", sym, side, strength, msg)
 
@@ -601,7 +640,7 @@ async def radar_loop():
     connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        print("🐋 CryptoBBSakti ALL-MARKET Radar V700 starting...")
+        print("🐋 CryptoBBSakti ALL-MARKET Radar V800 starting...")
 
         while True:
             started = time.time()
@@ -622,7 +661,7 @@ async def radar_loop():
 
                 if first_cycle:
                     print(
-                        f"RADAR V700 WARM-UP | SPOT baseline={spot_stage1} | "
+                        f"RADAR V800 WARM-UP | SPOT baseline={spot_stage1} | "
                         f"FUTURES baseline={fut_stage1} | alert dinonaktifkan pada siklus pertama"
                     )
                     await asyncio.sleep(CYCLE_SLEEP)
@@ -657,14 +696,14 @@ async def radar_loop():
                 top_fut = ",".join(x["symbol"] for x in fut_jobs[:3]) or "-"
 
                 print(
-                    f"RADAR V700 OK | "
+                    f"RADAR V800 OK | "
                     f"SPOT stage1={spot_stage1} deep={len(spot_jobs)} alerts={spot_alerts} "
                     f"top={top_spot} | "
                     f"FUTURES stage1={fut_stage1} deep={len(fut_jobs)} alerts={fut_alerts} "
                     f"top={top_fut} | {time.time()-started:.0f}s"
                 )
             except Exception as e:
-                print(f"RADAR V700 ERROR | {repr(e)}")
+                print(f"RADAR V800 ERROR | {repr(e)}")
 
             await asyncio.sleep(CYCLE_SLEEP)
 
@@ -673,7 +712,7 @@ async def health(_):
     return web.json_response({
         "ok": True,
         "service": "CryptoBBSakti ALL-MARKET Radar",
-        "version": "V700",
+        "version": "V800",
         "scope": "ALL Bitget USDT SPOT + USDT FUTURES",
         "dedup": len(seen),
         "time": int(time.time()),
@@ -694,7 +733,7 @@ async def main():
     await start_health()
     try:
         await tg.send(
-            "🐋 <b>CryptoBBSakti Radar V700 AKTIF</b>\n\n"
+            "🐋 <b>CryptoBBSakti Radar V800 AKTIF</b>\n\n"
             "✅ Semua koin Bitget USDT SPOT\n"
             "✅ Semua koin Bitget USDT FUTURES\n"
             "✅ BTC & ETH termasuk\n"
@@ -702,7 +741,8 @@ async def main():
             "⚡ Tahap 1 menyaring seluruh ticker setiap siklus\n"
             "🔬 Tahap 2 memeriksa kandidat anomali terkuat\n"
             "🎯 Telegram hanya: CONFIRMED / STRONG\n"
-            "🛑 Futures dilengkapi SL + TP1 + TP2 + TP3 berbasis ATR 15m\n"
+            "🕯 Futures memakai candle + EMA9/21 + RSI14 + struktur + ATR\n"
+            "🎯 Zona Entry + SL + TP1 + TP2 + TP3 dinamis\n"
             "🛡️ Siklus pertama digunakan untuk WARM-UP baseline\n"
             "📡 Mode analisis, tanpa eksekusi otomatis."
         )
