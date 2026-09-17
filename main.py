@@ -372,7 +372,6 @@ async def health(_):
         "time": int(time.time())
     })
 
-
 async def start_health():
     app = web.Application()
     app.router.add_get("/", health)
