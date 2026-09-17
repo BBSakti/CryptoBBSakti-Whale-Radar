@@ -364,7 +364,7 @@ async def radar_loop():
         except Exception as err:
             print("Whale Radar V2 error:", repr(err))
             await asyncio.sleep(10)
-            async def health(_):
+    async def health(_):
     return web.json_response({
         "ok": True,
         "service": "CryptoBBSakti Whale Radar",
