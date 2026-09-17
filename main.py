@@ -31,6 +31,7 @@ spot_cursor = 0
 futures_cursor = 0
 previous_spot = {}
 previous_futures = {}
+warmup_complete = False
 
 
 def f(v, d=0.0):
@@ -218,12 +219,23 @@ async def futures_candles(session, symbol):
 
         ret15 = (closes[-1] / closes[-2] - 1) * 100
         ret60 = (closes[-1] / closes[-5] - 1) * 100 if len(closes) >= 5 else 0.0
+
+        # ATR sederhana 14 candle untuk level risiko dinamis.
+        trs = []
+        for i in range(1, len(rows)):
+            h = highs[i]
+            l = lows[i]
+            pc = closes[i - 1]
+            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        atr14 = sum(trs[-14:]) / max(len(trs[-14:]), 1)
+
         return {
             "vol_ratio": vol_ratio,
             "breakout": breakout,
             "breakdown": breakdown,
             "ret15": ret15,
             "ret60": ret60,
+            "atr": atr14,
         }
     except Exception:
         return None
@@ -354,19 +366,34 @@ async def scan_spot(session, ticker):
         else f"{tier} DISTRIBUTION"
     )
 
+    # V700 tidak mengirim WATCH ke Telegram. WATCH tetap dihitung internal.
+    if tier == "WATCH":
+        return False
+
+    if side == "BUY":
+        action = "PERTIMBANGKAN BELI BERTAHAP" if tier == "CONFIRMED" else "KANDIDAT BELI KUAT"
+        meaning = "Tekanan beli pelaku besar lebih dominan. Cari entry bertahap/pullback, jangan mengejar harga."
+        title = "🟢 SPOT: TEKANAN BELI"
+    else:
+        action = "JANGAN BELI / PERTIMBANGKAN KURANGI" if tier == "CONFIRMED" else "HINDARI BELI / DISTRIBUSI KUAT"
+        meaning = "Tekanan jual pelaku besar lebih dominan. Ini bukan sinyal membeli. Jika sudah memegang, evaluasi risiko dan support."
+        title = "🔴 SPOT: TEKANAN JUAL"
+
     msg = (
-        f"{'🟢' if side == 'BUY' else '🔴'} <b>SPOT {side} PRESSURE</b>\n\n"
+        f"{title}\n\n"
         f"🪙 <b>{sym}</b>\n"
-        f"💵 Price: ${ticker['price']:.8g}\n"
-        f"📊 24H: {ticker['change']:+.2f}%\n"
-        f"🔥 Turnover 24H: {usd(ticker['turnover'])}\n"
-        f"🐋 Whale dominance: <b>{dom:.1%}</b>\n"
-        f"🌊 Whale flow (native units): buy {buy:.4g} / sell {sell:.4g}\n"
-        f"⚡ Turnover acceleration: {ticker.get('turnover_accel', 1.0):.3f}x\n"
-        f"🧭 Short move: {ticker.get('short_move', 0.0):.2f}%\n"
+        f"💵 Harga: ${ticker['price']:.8g}\n"
+        f"📊 Perubahan 24J: {ticker['change']:+.2f}%\n"
+        f"🔥 Turnover 24J: {usd(ticker['turnover'])}\n"
+        f"🐋 Dominasi whale: <b>{dom:.1%}</b>\n"
+        f"🌊 Arus whale (unit asli): beli {buy:.4g} / jual {sell:.4g}\n"
+        f"⚡ Akselerasi turnover: {ticker.get('turnover_accel', 1.0):.3f}x\n"
+        f"🧭 Gerak sejak siklus lalu: {ticker.get('short_move', 0.0):.2f}%\n"
         f"📚 Order book: {book_text}\n"
-        f"{tier_icon} Confidence: <b>{status}</b> | score {score}/5\n\n"
-        f"ℹ️ Bitget SPOT market-flow. Native flow units are shown without an unverified USD conversion."
+        f"{tier_icon} Tingkat keyakinan: <b>{tier}</b> | skor {score}/5\n\n"
+        f"🎯 <b>TINDAKAN: {action}</b>\n"
+        f"📝 Arti: {meaning}\n\n"
+        f"ℹ️ Analisis arus pasar SPOT Bitget. Bukan eksekusi otomatis."
     )
     return await send_once("spot", sym, side, strength, msg)
 
@@ -451,24 +478,69 @@ async def scan_futures(session, ticker):
         fut_tier = "WATCH"
         fut_icon = "👀"
 
+    # V700 hanya mengirim CONFIRMED atau STRONG.
+    if fut_tier == "WATCH":
+        return False
+
+    if side == "LONG":
+        fut_action = "PERTIMBANGKAN LONG" if fut_tier == "CONFIRMED" else "KANDIDAT LONG KUAT"
+        fut_meaning = "Tekanan transaksi dan konfirmasi teknikal condong naik. Tunggu entry yang disiplin, bukan mengejar candle."
+        fut_title = f"🔵 FUTURES: POTENSI LONG {fut_tier}"
+    else:
+        fut_action = "PERTIMBANGKAN SHORT" if fut_tier == "CONFIRMED" else "KANDIDAT SHORT KUAT"
+        fut_meaning = "Tekanan transaksi dan konfirmasi teknikal condong turun. Waspadai short squeeze dan invalidasi."
+        fut_title = f"🔴 FUTURES: POTENSI SHORT {fut_tier}"
+
+    # Level SL/TP berbasis ATR 15m, bukan persentase statis.
+    entry = ticker["price"]
+    atr = candles.get("atr", 0.0)
+    if atr <= 0:
+        atr = entry * 0.01
+
+    risk = max(atr * 1.25, entry * 0.004)
+    if side == "LONG":
+        sl = entry - risk
+        tp1 = entry + risk
+        tp2 = entry + risk * 2.0
+        tp3 = entry + risk * 3.0
+    else:
+        sl = entry + risk
+        tp1 = entry - risk
+        tp2 = entry - risk * 2.0
+        tp3 = entry - risk * 3.0
+
+    # Jangan tampilkan harga negatif pada aset berharga sangat kecil.
+    tp1 = max(tp1, 0.0)
+    tp2 = max(tp2, 0.0)
+    tp3 = max(tp3, 0.0)
+    risk_pct = abs(sl / entry - 1.0) * 100 if entry > 0 else 0.0
+
     msg = (
-        f"{'🔵' if side == 'LONG' else '🔴'} <b>FUTURES {side} {fut_tier}</b>\n\n"
+        f"{fut_title}\n\n"
         f"🪙 <b>{sym}</b>\n"
-        f"💵 Price: ${ticker['price']:.8g}\n"
-        f"📊 24H: {ticker['change']:+.2f}%\n"
-        f"🔥 Futures turnover: {usd(ticker['turnover'])}\n"
-        f"⚡ Aggressive trade dominance: <b>{dom:.1%}</b>\n"
-        f"🌋 15m volume spike: <b>{candles['vol_ratio']:.2f}x</b>\n"
+        f"💵 Harga: ${ticker['price']:.8g}\n"
+        f"📊 Perubahan 24J: {ticker['change']:+.2f}%\n"
+        f"🔥 Turnover futures: {usd(ticker['turnover'])}\n"
+        f"⚡ Dominasi transaksi agresif: <b>{dom:.1%}</b>\n"
+        f"🌋 Lonjakan volume 15m: <b>{candles['vol_ratio']:.2f}x</b>\n"
         f"🧭 15m / 60m: {candles['ret15']:+.2f}% / {candles['ret60']:+.2f}%\n"
-        f"🧱 Structure: <b>{'BREAKOUT' if candles['breakout'] else 'BREAKDOWN' if candles['breakdown'] else 'RANGE'}</b>\n"
+        f"🧱 Struktur: <b>{'BREAKOUT' if candles['breakout'] else 'BREAKDOWN' if candles['breakdown'] else 'RANGE'}</b>\n"
         f"📚 Order book: {book_text}\n"
         f"⚖️ Long/Short: {ls_text}\n"
-        f"💸 Funding: {ticker['funding']:.6f}\n"
-        f"📦 OI snapshot: {ticker['oi']:.4g}\n"
-        f"{fut_icon} Confidence: <b>{fut_tier}</b>\n"
-        f"🎯 Quality score: <b>{score}/8</b>\n"
+        f"💸 Funding rate: {ticker['funding']:.6f}\n"
+        f"📦 Open Interest: {ticker['oi']:.4g}\n"
+        f"{fut_icon} Tingkat keyakinan: <b>{fut_tier}</b>\n"
+        f"🎯 Skor kualitas: <b>{score}/8</b>\n"
         f"📡 Bias: <b>{side}</b>\n\n"
-        f"ℹ️ Multi-confirmation futures signal. Analysis-only."
+        f"💰 <b>AREA ENTRY: ${entry:.8g}</b>\n"
+        f"🛑 <b>SL: ${sl:.8g}</b> ({risk_pct:.2f}% dari entry)\n"
+        f"🎯 <b>TP1: ${tp1:.8g}</b> | R:R 1:1\n"
+        f"🎯 <b>TP2: ${tp2:.8g}</b> | R:R 1:2\n"
+        f"🏆 <b>TP3: ${tp3:.8g}</b> | R:R 1:3\n"
+        f"📐 Level dihitung dinamis dari ATR 15m.\n\n"
+        f"🎯 <b>TINDAKAN: {fut_action}</b>\n"
+        f"📝 Arti: {fut_meaning}\n\n"
+        f"ℹ️ Sinyal futures multi-konfirmasi. Analisis saja, bukan eksekusi otomatis."
     )
     return await send_once("futures", sym, side, strength, msg)
 
@@ -529,7 +601,7 @@ async def radar_loop():
     connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        print("🐋 CryptoBBSakti ALL-MARKET Radar V500 starting...")
+        print("🐋 CryptoBBSakti ALL-MARKET Radar V700 starting...")
 
         while True:
             started = time.time()
@@ -539,13 +611,22 @@ async def radar_loop():
                     futures_universe(session),
                 )
 
-                # STAGE 1: ALL returned USDT tickers are scored every cycle.
+                # STAGE 1: semua ticker dinilai setiap siklus.
+           first_cycle = not previous_spot and not previous_futures
                 spot_jobs, spot_stage1 = anomaly_rank(
                     spots, previous_spot, SPOT_FLOW_BUDGET
                 )
                 fut_jobs, fut_stage1 = anomaly_rank(
                     futures, previous_futures, FUTURES_BUDGET
                 )
+
+                if first_cycle:
+                    print(
+                        f"RADAR V700 WARM-UP | SPOT baseline={spot_stage1} | "
+                        f"FUTURES baseline={fut_stage1} | alert dinonaktifkan pada siklus pertama"
+                    )
+                    await asyncio.sleep(CYCLE_SLEEP)
+                    continue
 
                 spot_alerts = fut_alerts = 0
 
@@ -576,14 +657,14 @@ async def radar_loop():
                 top_fut = ",".join(x["symbol"] for x in fut_jobs[:3]) or "-"
 
                 print(
-                    f"RADAR V500 OK | "
+                    f"RADAR V700 OK | "
                     f"SPOT stage1={spot_stage1} deep={len(spot_jobs)} alerts={spot_alerts} "
                     f"top={top_spot} | "
                     f"FUTURES stage1={fut_stage1} deep={len(fut_jobs)} alerts={fut_alerts} "
                     f"top={top_fut} | {time.time()-started:.0f}s"
                 )
             except Exception as e:
-                print(f"RADAR V500 ERROR | {repr(e)}")
+                print(f"RADAR V700 ERROR | {repr(e)}")
 
             await asyncio.sleep(CYCLE_SLEEP)
 
@@ -592,7 +673,7 @@ async def health(_):
     return web.json_response({
         "ok": True,
         "service": "CryptoBBSakti ALL-MARKET Radar",
-        "version": "V500",
+        "version": "V700",
         "scope": "ALL Bitget USDT SPOT + USDT FUTURES",
         "dedup": len(seen),
         "time": int(time.time()),
@@ -613,15 +694,17 @@ async def main():
     await start_health()
     try:
         await tg.send(
-            "🐋 <b>CryptoBBSakti ALL-MARKET Radar V500 ONLINE</b>\n\n"
-            "✅ ALL Bitget USDT SPOT coins\n"
-            "✅ ALL Bitget USDT FUTURES coins\n"
-            "✅ BTC & ETH INCLUDED\n"
-            "🚫 No priority coin whitelist\n"
-              "⚡ Stage 1 scans ALL tickers every cycle\n"
-            "🔬 Stage 2 deep-scans strongest anomalies\n"
-            "🎯 WATCH / CONFIRMED / STRONG confidence tiers\n"
-            "📡 Analysis-only mode."
+            "🐋 <b>CryptoBBSakti Radar V700 AKTIF</b>\n\n"
+            "✅ Semua koin Bitget USDT SPOT\n"
+            "✅ Semua koin Bitget USDT FUTURES\n"
+            "✅ BTC & ETH termasuk\n"
+            "🚫 Tidak ada koin prioritas\n"
+            "⚡ Tahap 1 menyaring seluruh ticker setiap siklus\n"
+            "🔬 Tahap 2 memeriksa kandidat anomali terkuat\n"
+            "🎯 Telegram hanya: CONFIRMED / STRONG\n"
+            "🛑 Futures dilengkapi SL + TP1 + TP2 + TP3 berbasis ATR 15m\n"
+            "🛡️ Siklus pertama digunakan untuk WARM-UP baseline\n"
+            "📡 Mode analisis, tanpa eksekusi otomatis."
         )
     except Exception as e:
         print(f"TELEGRAM STARTUP WARNING | {repr(e)}")
