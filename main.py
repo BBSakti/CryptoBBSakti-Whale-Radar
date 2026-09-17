@@ -131,7 +131,6 @@ async def process(e):
     await tg.send(format_alert(e, a))
 
 async def radar_loop():
-    async def radar_loop():
     backoff = 5
 
     while True:
@@ -151,6 +150,7 @@ async def radar_loop():
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
+
 async def health(_):
     return web.json_response({
         "ok": True,
@@ -159,23 +159,39 @@ async def health(_):
         "time": int(time.time())
     })
 
+
 async def start_health():
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        PORT
+    )
+
     await site.start()
     print(f"Health server listening on :{PORT}")
 
+
 async def main():
     await start_health()
+
     if SEND_STARTUP:
-        await tg.send(
-    "🐋 <b>CryptoBBSakti Whale Radar ONLINE</b>\n"
-    "Birdeye Standard REST monitoring aktif."
-        )
+        try:
+            await tg.send(
+                "🐋 <b>CryptoBBSakti Whale Radar ONLINE</b>\n"
+                "Birdeye Standard REST monitoring aktif."
+            )
+        except Exception as err:
+            print("Telegram startup warning:", repr(err))
+
+    await radar_loop()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
