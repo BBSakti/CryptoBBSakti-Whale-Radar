@@ -311,36 +311,62 @@ async def scan_spot(session, ticker):
         return False
 
     net_native = abs(buy - sell)
-    net_usd = net_native * ticker["price"]
-    dynamic_min = max(50_000.0, min(1_000_000.0, ticker["turnover"] * 0.01))
-    if net_usd < dynamic_min:
-        return False
 
     if side == "BUY" and ticker["change"] > MAX_PUMP:
         return False
 
     book = await spot_book(session, sym)
     book_text = "N/A"
-    confirm = False
+    book_confirm = False
+    book_conflict = False
     if book:
         bid_r, ask_r = book
         book_text = f"BID {bid_r:.0%} / ASK {ask_r:.0%}"
-        confirm = bid_r >= 0.55 if side == "BUY" else ask_r >= 0.55
+        book_confirm = bid_r >= 0.55 if side == "BUY" else ask_r >= 0.55
+        book_conflict = ask_r >= 0.58 if side == "BUY" else bid_r >= 0.58
 
-    strength = dom + min(net_usd / max(ticker["turnover"], 1), 1.0) + (0.1 if confirm else 0)
-    status = "EARLY/WATCH" if side == "BUY" else "DISTRIBUTION/WATCH"
+    score = 0
+    score += 2 if dom >= 0.80 else 1
+    score += 1 if ticker.get("turnover_accel", 1.0) >= 1.02 else 0
+    score += 1 if ticker.get("short_move", 0.0) >= 0.25 else 0
+    score += 1 if book_confirm else 0
+    score -= 1 if book_conflict else 0
+
+    if score >= 5:
+        tier = "STRONG"
+        tier_icon = "🔥"
+    elif score >= 3:
+        tier = "CONFIRMED"
+        tier_icon = "✅"
+    else:
+        tier = "WATCH"
+        tier_icon = "👀"
+
+    # Distribution after a large 24h rise is important, but a conflicting
+    # bid-heavy book keeps it in WATCH/CONFIRMED rather than overstating certainty.
+    if side == "SELL" and ticker["change"] >= 15 and book_conflict and tier == "STRONG":
+        tier = "CONFIRMED"
+        tier_icon = "✅"
+
+    strength = score + dom
+    status = (
+        f"{tier} ACCUMULATION" if side == "BUY"
+        else f"{tier} DISTRIBUTION"
+    )
 
     msg = (
         f"{'🟢' if side == 'BUY' else '🔴'} <b>SPOT {side} PRESSURE</b>\n\n"
         f"🪙 <b>{sym}</b>\n"
         f"💵 Price: ${ticker['price']:.8g}\n"
         f"📊 24H: {ticker['change']:+.2f}%\n"
-        f"🔥 Turnover: {usd(ticker['turnover'])}\n"
+        f"🔥 Turnover 24H: {usd(ticker['turnover'])}\n"
         f"🐋 Whale dominance: <b>{dom:.1%}</b>\n"
-        f"💰 Whale net est.: <b>{usd(net_usd)}</b>\n"
+        f"🌊 Whale flow (native units): buy {buy:.4g} / sell {sell:.4g}\n"
+        f"⚡ Turnover acceleration: {ticker.get('turnover_accel', 1.0):.3f}x\n"
+        f"🧭 Short move: {ticker.get('short_move', 0.0):.2f}%\n"
         f"📚 Order book: {book_text}\n"
-        f"📡 Status: <b>{status}</b>\n\n"
-        f"ℹ️ Bitget SPOT market-flow signal."
+        f"{tier_icon} Confidence: <b>{status}</b> | score {score}/5\n\n"
+        f"ℹ️ Bitget SPOT market-flow. Native flow units are shown without an unverified USD conversion."
     )
     return await send_once("spot", sym, side, strength, msg)
 
@@ -415,8 +441,18 @@ async def scan_futures(session, ticker):
     flow_total = buy + sell
     strength = score + dom
 
+    if score >= 7:
+        fut_tier = "STRONG"
+        fut_icon = "🔥"
+    elif score >= 6:
+        fut_tier = "CONFIRMED"
+        fut_icon = "✅"
+    else:
+        fut_tier = "WATCH"
+        fut_icon = "👀"
+
     msg = (
-        f"{'🔵' if side == 'LONG' else '🔴'} <b>FUTURES {side} HIGH-CONVICTION</b>\n\n"
+        f"{'🔵' if side == 'LONG' else '🔴'} <b>FUTURES {side} {fut_tier}</b>\n\n"
         f"🪙 <b>{sym}</b>\n"
         f"💵 Price: ${ticker['price']:.8g}\n"
         f"📊 24H: {ticker['change']:+.2f}%\n"
@@ -429,6 +465,7 @@ async def scan_futures(session, ticker):
         f"⚖️ Long/Short: {ls_text}\n"
         f"💸 Funding: {ticker['funding']:.6f}\n"
         f"📦 OI snapshot: {ticker['oi']:.4g}\n"
+        f"{fut_icon} Confidence: <b>{fut_tier}</b>\n"
         f"🎯 Quality score: <b>{score}/8</b>\n"
         f"📡 Bias: <b>{side}</b>\n\n"
         f"ℹ️ Multi-confirmation futures signal. Analysis-only."
@@ -492,7 +529,7 @@ async def radar_loop():
     connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        print("🐋 CryptoBBSakti ALL-MARKET Radar V400 starting...")
+        print("🐋 CryptoBBSakti ALL-MARKET Radar V500 starting...")
 
         while True:
             started = time.time()
@@ -539,14 +576,14 @@ async def radar_loop():
                 top_fut = ",".join(x["symbol"] for x in fut_jobs[:3]) or "-"
 
                 print(
-                    f"RADAR V400 OK | "
+                    f"RADAR V500 OK | "
                     f"SPOT stage1={spot_stage1} deep={len(spot_jobs)} alerts={spot_alerts} "
                     f"top={top_spot} | "
                     f"FUTURES stage1={fut_stage1} deep={len(fut_jobs)} alerts={fut_alerts} "
                     f"top={top_fut} | {time.time()-started:.0f}s"
                 )
             except Exception as e:
-                print(f"RADAR V400 ERROR | {repr(e)}")
+                print(f"RADAR V500 ERROR | {repr(e)}")
 
             await asyncio.sleep(CYCLE_SLEEP)
 
@@ -555,7 +592,7 @@ async def health(_):
     return web.json_response({
         "ok": True,
         "service": "CryptoBBSakti ALL-MARKET Radar",
-        "version": "V400",
+        "version": "V500",
         "scope": "ALL Bitget USDT SPOT + USDT FUTURES",
         "dedup": len(seen),
         "time": int(time.time()),
@@ -576,20 +613,9 @@ async def main():
     await start_health()
     try:
         await tg.send(
-            "🐋 <b>CryptoBBSakti ALL-MARKET Radar V400 ONLINE</b>\n\n"
+            "🐋 <b>CryptoBBSakti ALL-MARKET Radar V500 ONLINE</b>\n\n"
             "✅ ALL Bitget USDT SPOT coins\n"
             "✅ ALL Bitget USDT FUTURES coins\n"
             "✅ BTC & ETH INCLUDED\n"
             "🚫 No priority coin whitelist\n"
-            "⚡ Stage 1 scans ALL tickers every cycle\n"
-            "🔬 Stage 2 deep-scans strongest anomalies\n"
-            "📡 Analysis-only mode."
-        )
-    except Exception as e:
-        print(f"TELEGRAM STARTUP WARNING | {repr(e)}")
-
-    await radar_loop()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+  
