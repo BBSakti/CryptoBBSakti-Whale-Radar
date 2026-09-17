@@ -131,16 +131,23 @@ async def process(e):
     await tg.send(format_alert(e, a))
 
 async def radar_loop():
-    backoff = 2
+    async def radar_loop():
+    backoff = 5
+
     while True:
         try:
-            async for msg in be.stream():
-                e = normalize_large_trade(msg)
-                if e:
-                    asyncio.create_task(process(e))
-            backoff = 2
+            print("🐋 Birdeye REST Smart Money radar starting...")
+
+            async for item in be.poll():
+                event = normalize_smart_money(item)
+
+                if event:
+                    asyncio.create_task(process(event))
+
+            backoff = 5
+
         except Exception as err:
-            print("Radar connection error:", repr(err))
+            print("Radar REST error:", repr(err))
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
@@ -148,7 +155,7 @@ async def health(_):
     return web.json_response({
         "ok": True,
         "service": "CryptoBBSakti Whale Radar",
-        "mode": "event-driven",
+        "mode": "Birdeye Standard REST polling",
         "time": int(time.time())
     })
 
@@ -165,8 +172,10 @@ async def start_health():
 async def main():
     await start_health()
     if SEND_STARTUP:
-        await tg.send("🐋 <b>CryptoBBSakti Whale Radar ONLINE</b>\nEvent-driven monitoring aktif.")
-    await radar_loop()
+        await tg.send(
+    "🐋 <b>CryptoBBSakti Whale Radar ONLINE</b>\n"
+    "Birdeye Standard REST monitoring aktif."
+        )
 
 if __name__ == "__main__":
     asyncio.run(main())
