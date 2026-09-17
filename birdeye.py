@@ -48,7 +48,7 @@ class Birdeye:
         # URL query-token endpoint instead, set BIRDEYE_WS_URL accordingly.
         async with websockets.connect(
             self.ws_url,
-            additional_headers={"X-API-KEY": self.api_key},
+            extra_headers={"X-API-KEY": self.api_key},
             ping_interval=20,
             ping_timeout=20,
             close_timeout=10,
