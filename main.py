@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import os
 import time
+import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 
@@ -131,31 +132,152 @@ async def process(e):
     await tg.send(format_alert(e, a))
 
 async def radar_loop():
-    backoff = 5
+    print("🐋 Bitget SPOT Large-Trade Radar starting...")
+
+    processed = set()
 
     while True:
         try:
-            print("🐋 Birdeye REST Smart Money radar starting...")
+            timeout = aiohttp.ClientTimeout(total=20)
 
-            async for item in be.poll():
-                event = normalize_smart_money(item)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
 
-                if event:
-                    asyncio.create_task(process(event))
+                # Ambil seluruh ticker SPOT Bitget
+                ticker_url = (
+                    "https://api.bitget.com/api/v3/market/tickers"
+                    "?category=SPOT"
+                )
 
-            backoff = 5
+                async with session.get(ticker_url) as r:
+                    payload = await r.json()
+
+                tickers = payload.get("data") or []
+
+                # Fokus pair USDT dengan turnover besar.
+                candidates = []
+
+                for t in tickers:
+                    symbol = str(t.get("symbol") or "")
+
+                    if not symbol.endswith("USDT"):
+                        continue
+
+                    if symbol in ("BTCUSDT", "ETHUSDT"):
+                        continue
+
+                    try:
+                        turnover = float(t.get("turnover24h") or 0)
+                        change = float(t.get("price24hPcnt") or 0) * 100
+                    except Exception:
+                        continue
+
+                    # Minimum $1M turnover 24H
+                    if turnover < 1_000_000:
+                        continue
+
+                    # Kita cari yang belum terlalu extended
+                    if change > MAX_PUMP:
+                        continue
+
+                    candidates.append(
+                        (symbol, turnover, change)
+                    )
+
+                # Prioritaskan liquidity/turnover terbesar
+                candidates.sort(
+                    key=lambda x: x[1],
+                    reverse=True
+                )
+
+                # Batasi supaya tidak menghajar API
+                for symbol, turnover, change in candidates[:40]:
+
+                    fills_url = (
+                        "https://api.bitget.com/api/v3/market/fills"
+                    )
+
+                    params = {
+                        "category": "SPOT",
+                        "symbol": symbol,
+                        "limit": "100",
+                    }
+
+                    async with session.get(
+                        fills_url,
+                        params=params
+                    ) as r:
+
+                        fills_payload = await r.json()
+
+                    fills = fills_payload.get("data") or []
+
+                    for fill in fills:
+
+                        try:
+                            price = float(fill.get("price") or 0)
+                            size = float(fill.get("size") or 0)
+                            usd = price * size
+
+                            side = str(
+                                fill.get("side") or ""
+                            ).lower()
+
+                            exec_id = str(
+                                fill.get("execId")
+                                or (
+                                    f'{symbol}:'
+                                    f'{fill.get("ts")}:'
+                                    f'{price}:{size}:{side}'
+                                )
+                            )
+
+                        except Exception:
+                            continue
+
+                        if exec_id in processed:
+                            continue
+
+                        processed.add(exec_id)
+
+                        # Individual large SPOT trade
+                        if usd < SMALL_MIN:
+                            continue
+
+                        base = symbol[:-4]
+
+                        e = {
+                            "side": side,
+                            "symbol": base,
+                            "address": "",
+                            "network": "bitget-spot",
+                            "usd": usd,
+                            "tx": exec_id,
+                            "wallet": "Large Bitget SPOT trade",
+                        }
+
+                        # >= $1M langsung diproses.
+                        # $100K-$1M tetap masuk assess()
+                        # untuk filter lanjutan.
+                        asyncio.create_task(process(e))
+
+                    await asyncio.sleep(0.08)
+
+            # Jaga memory dedup
+            if len(processed) > 50000:
+                processed.clear()
+
+            await asyncio.sleep(15)
 
         except Exception as err:
-            print("Radar REST error:", repr(err))
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+            print("Bitget radar error:", repr(err))
+            await asyncio.sleep(10)
 
 
 async def health(_):
     return web.json_response({
         "ok": True,
         "service": "CryptoBBSakti Whale Radar",
-        "mode": "Birdeye Standard REST polling",
+        "mode": "Bitget SPOT large-trade radar",
         "time": int(time.time())
     })
 
@@ -184,8 +306,8 @@ async def main():
     if SEND_STARTUP:
         try:
             await tg.send(
-                "🐋 <b>CryptoBBSakti Whale Radar ONLINE</b>\n"
-                "Birdeye Standard REST monitoring aktif."
+    "🐋 <b>CryptoBBSakti Whale Radar ONLINE</b>\n"
+    "Bitget SPOT large-trade monitoring aktif."
             )
         except Exception as err:
             print("Telegram startup warning:", repr(err))
