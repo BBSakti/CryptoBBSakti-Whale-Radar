@@ -364,3 +364,43 @@ async def radar_loop():
         except Exception as err:
             print("Whale Radar V2 error:", repr(err))
             await asyncio.sleep(10)
+            async def health(_):
+    return web.json_response({
+        "ok": True,
+        "service": "CryptoBBSakti Whale Radar",
+        "mode": "Bitget SPOT Whale Radar V2",
+        "time": int(time.time())
+    })
+
+
+async def start_health():
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+    print(f"Health server listening on :{PORT}")
+
+
+async def main():
+    await start_health()
+
+    if SEND_STARTUP:
+        try:
+            await tg.send(
+                "🐋 <b>CryptoBBSakti Whale Radar V2 ONLINE</b>\n"
+                "Bitget SPOT flow monitoring aktif."
+            )
+        except Exception as err:
+            print("Telegram startup warning:", repr(err))
+
+    await radar_loop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
