@@ -1,8 +1,8 @@
+import aiohttp
 import asyncio
 import hashlib
 import os
 import time
-import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 
@@ -67,9 +67,7 @@ async def assess(e):
     ratio = (e["usd"] / liquidity) if liquidity > 0 else 0
 
     # Large-cap threshold OR unusually large relative to known liquidity.
-    qualifies_size = e["usd"] >= WHALE_MIN or (
-        e["usd"] >= SMALL_MIN and liquidity >= MIN_LIQ and ratio >= MIN_RATIO
-    )
+    qualifies_size = e["usd"] >= SMALL_MIN
     if not qualifies_size:
         return None
 
@@ -98,7 +96,7 @@ def format_alert(e, a):
     title = "WHALE BUY / ACCUMULATION" if e["side"] == "buy" else "WHALE SELL / DISTRIBUTION"
     listed = ", ".join(sorted({x["exchange"] for x in a["markets"]}))
     liq = money(a["liquidity"]) if a["liquidity"] else "N/A"
-    wallet = e["wallet"] or "large wallet"
+    wallet = e["wallet"] or "Aggregated SPOT flow"
     return (
         f'{icon} <b>{title}</b>\n\n'
         f'🪙 <b>{e["symbol"]}/USDT</b>\n'
@@ -132,28 +130,41 @@ async def process(e):
     await tg.send(format_alert(e, a))
 
 async def radar_loop():
-    print("🐋 Bitget SPOT Large-Trade Radar starting...")
+    print("🐋 Whale Radar V2 starting...")
 
     processed = set()
+    last_heartbeat = 0
+
+    SCAN_PAIRS = 40
+    WINDOW_SECONDS = 180       # agregasi 3 menit
+    MIN_FLOW_USD = 250_000     # minimum gross flow
+    MIN_NET_USD = 100_000      # minimum net imbalance
+    IMBALANCE_TRIGGER = 0.68    # 68% dominasi BUY / SELL
 
     while True:
         try:
+            cycle_start = time.time()
+            fills_scanned = 0
+            active_pairs = 0
+            signals = 0
+
             timeout = aiohttp.ClientTimeout(total=20)
 
             async with aiohttp.ClientSession(timeout=timeout) as session:
 
-                # Ambil seluruh ticker SPOT Bitget
-                ticker_url = (
-                    "https://api.bitget.com/api/v3/market/tickers"
-                    "?category=SPOT"
-                )
+                # ==============================
+                # 1. AMBIL SEMUA TICKER SPOT
+                # ==============================
+                ticker_url = "https://api.bitget.com/api/v3/market/tickers"
 
-                async with session.get(ticker_url) as r:
+                async with session.get(
+                    ticker_url,
+                    params={"category": "SPOT"}
+                ) as r:
                     payload = await r.json()
 
                 tickers = payload.get("data") or []
 
-                # Fokus pair USDT dengan turnover besar.
                 candidates = []
 
                 for t in tickers:
@@ -168,33 +179,35 @@ async def radar_loop():
                     try:
                         turnover = float(t.get("turnover24h") or 0)
                         change = float(t.get("price24hPcnt") or 0) * 100
-                    except Exception:
+                        price = float(t.get("lastPrice") or 0)
+                    except (TypeError, ValueError):
                         continue
 
-                    # Minimum $1M turnover 24H
                     if turnover < 1_000_000:
                         continue
 
-                    # Kita cari yang belum terlalu extended
-                    if change > MAX_PUMP:
-                        continue
+                    candidates.append({
+                        "symbol": symbol,
+                        "turnover": turnover,
+                        "change": change,
+                        "price": price,
+                    })
 
-                    candidates.append(
-                        (symbol, turnover, change)
-                    )
-
-                # Prioritaskan liquidity/turnover terbesar
+                # Prioritaskan pasar aktif
                 candidates.sort(
-                    key=lambda x: x[1],
+                    key=lambda x: x["turnover"],
                     reverse=True
                 )
 
-                # Batasi supaya tidak menghajar API
-                for symbol, turnover, change in candidates[:40]:
+                candidates = candidates[:SCAN_PAIRS]
+                now_ms = int(time.time() * 1000)
 
-                    fills_url = (
-                        "https://api.bitget.com/api/v3/market/fills"
-                    )
+                # ==============================
+                # 2. SCAN RECENT FILLS
+                # ==============================
+                for c in candidates:
+
+                    symbol = c["symbol"]
 
                     params = {
                         "category": "SPOT",
@@ -203,117 +216,151 @@ async def radar_loop():
                     }
 
                     async with session.get(
-                        fills_url,
+                        "https://api.bitget.com/api/v3/market/fills",
                         params=params
                     ) as r:
+                        fp = await r.json()
 
-                        fills_payload = await r.json()
+                    fills = fp.get("data") or []
 
-                    fills = fills_payload.get("data") or []
+                    buy_usd = 0.0
+                    sell_usd = 0.0
+                    newest_ts = 0
 
                     for fill in fills:
 
                         try:
+                            ts = int(fill.get("ts") or 0)
                             price = float(fill.get("price") or 0)
                             size = float(fill.get("size") or 0)
+                            side = str(fill.get("side") or "").lower()
+
                             usd = price * size
 
-                            side = str(
-                                fill.get("side") or ""
-                            ).lower()
-
-                            exec_id = str(
-                                fill.get("execId")
-                                or (
-                                    f'{symbol}:'
-                                    f'{fill.get("ts")}:'
-                                    f'{price}:{size}:{side}'
-                                )
-                            )
-
-                        except Exception:
+                        except (TypeError, ValueError):
                             continue
 
-                        if exec_id in processed:
+                        # Hanya transaksi 3 menit terakhir
+                        age = (now_ms - ts) / 1000
+
+                        if age < 0 or age > WINDOW_SECONDS:
                             continue
 
-                        processed.add(exec_id)
+                        fills_scanned += 1
+                        newest_ts = max(newest_ts, ts)
 
-                        # Individual large SPOT trade
-                        if usd < SMALL_MIN:
-                            continue
+                        if side == "buy":
+                            buy_usd += usd
 
-                        base = symbol[:-4]
+                        elif side == "sell":
+                            sell_usd += usd
 
-                        e = {
-                            "side": side,
-                            "symbol": base,
-                            "address": "",
-                            "network": "bitget-spot",
-                            "usd": usd,
-                            "tx": exec_id,
-                            "wallet": "Large Bitget SPOT trade",
-                        }
+                    gross = buy_usd + sell_usd
 
-                        # >= $1M langsung diproses.
-                        # $100K-$1M tetap masuk assess()
-                        # untuk filter lanjutan.
-                        asyncio.create_task(process(e))
+                    if gross <= 0:
+                        continue
 
-                    await asyncio.sleep(0.08)
+                    active_pairs += 1
 
-            # Jaga memory dedup
-            if len(processed) > 50000:
+                    buy_ratio = buy_usd / gross
+                    sell_ratio = sell_usd / gross
+                    net = buy_usd - sell_usd
+
+                    # ==============================
+                    # 3. DETEKSI AKUMULASI
+                    # ==============================
+                    side = None
+                    flow_usd = 0
+
+                    if (
+                        gross >= MIN_FLOW_USD
+                        and net >= MIN_NET_USD
+                        and buy_ratio >= IMBALANCE_TRIGGER
+                    ):
+                        side = "buy"
+                        flow_usd = net
+
+                    # ==============================
+                    # 4. DETEKSI DISTRIBUSI
+                    # ==============================
+                    elif (
+                        gross >= MIN_FLOW_USD
+                        and net <= -MIN_NET_USD
+                        and sell_ratio >= IMBALANCE_TRIGGER
+                    ):
+                        side = "sell"
+                        flow_usd = abs(net)
+
+                    if not side:
+                        continue
+
+                    # BUY yang sudah pump terlalu tinggi
+                    # tetap dicatat sebagai extended.
+                    base = symbol[:-4]
+
+                    signal_key = (
+                        f"{symbol}:{side}:"
+                        f"{newest_ts // 180000}"
+                    )
+
+                    if signal_key in processed:
+                        continue
+
+                    processed.add(signal_key)
+
+                    e = {
+                        "side": side,
+                        "symbol": base,
+                        "address": "",
+                        "network": "bitget-spot",
+                        "usd": flow_usd,
+                        "tx": signal_key,
+                        "wallet": (
+                            f"Aggregated Bitget SPOT flow "
+                            f"(BUY {buy_ratio:.0%} / "
+                            f"SELL {sell_ratio:.0%})"
+                        ),
+                    }
+
+                    asyncio.create_task(process(e))
+                    signals += 1
+
+                    print(
+                        f"SIGNAL {symbol} | "
+                        f"{side.upper()} | "
+                        f"net=${flow_usd:,.0f} | "
+                        f"buy={buy_ratio:.0%} | "
+                        f"sell={sell_ratio:.0%}"
+                    )
+
+                    await asyncio.sleep(0.06)
+
+            # ==============================
+            # 5. HEARTBEAT
+            # ==============================
+            now = time.time()
+
+            if now - last_heartbeat >= 60:
+
+                print(
+                    f"RADAR OK | "
+                    f"{len(candidates)} pairs | "
+                    f"{active_pairs} active | "
+                    f"{fills_scanned} recent fills | "
+                    f"{signals} signals"
+                )
+
+                last_heartbeat = now
+
+            # Bersihkan dedup memory
+            if len(processed) > 10000:
                 processed.clear()
 
-            await asyncio.sleep(15)
+            elapsed = time.time() - cycle_start
+
+            # Target sekitar 15 detik per siklus
+            await asyncio.sleep(max(3, 15 - elapsed))
 
         except Exception as err:
-            print("Bitget radar error:", repr(err))
+            print("Whale Radar V2 error:", repr(err))
             await asyncio.sleep(10)
-
-
-async def health(_):
-    return web.json_response({
-        "ok": True,
-        "service": "CryptoBBSakti Whale Radar",
-        "mode": "Bitget SPOT large-trade radar",
-        "time": int(time.time())
-    })
-
-
-async def start_health():
-    app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-
-    site = web.TCPSite(
-        runner,
-        "0.0.0.0",
-        PORT
-    )
-
-    await site.start()
-    print(f"Health server listening on :{PORT}")
-
-
-async def main():
-    await start_health()
-
-    if SEND_STARTUP:
-        try:
-            await tg.send(
-    "🐋 <b>CryptoBBSakti Whale Radar ONLINE</b>\n"
-    "Bitget SPOT large-trade monitoring aktif."
-            )
-        except Exception as err:
-            print("Telegram startup warning:", repr(err))
-
-    await radar_loop()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
