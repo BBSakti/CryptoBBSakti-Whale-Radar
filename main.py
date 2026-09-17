@@ -32,6 +32,10 @@ futures_cursor = 0
 previous_spot = {}
 previous_futures = {}
 warmup_complete = False
+setup_state = {}
+ls_lock = asyncio.Lock()
+ls_last_call = 0.0
+SETUP_TTL = int(os.getenv("SETUP_TTL_SECONDS", "10800"))
 
 
 def f(v, d=0.0):
@@ -278,6 +282,10 @@ async def futures_candles(session, symbol):
             "rsi": rsi14, "support": support, "resistance": resistance,
             "swing_low": swing_low, "swing_high": swing_high, "pattern": pattern,
             "breakout_level": prev_high, "breakdown_level": prev_low,
+            "open": o1, "high": h1, "low": l1, "close": c1,
+            "prev_close": closes[-2], "candle_ts": int(rows[-1][0]),
+            "ema9_slope": ema9 - ema(closes[-41:-1], 9) if len(closes) >= 41 else 0.0,
+            "ema21_slope": ema21 - ema(closes[-51:-1], 21) if len(closes) >= 51 else 0.0,
         }
     except Exception as e:
         print(f"CANDLE ERROR | {symbol} | {repr(e)}")
@@ -305,10 +313,17 @@ async def futures_fills(session, symbol):
 
 
 async def futures_long_short(session, symbol):
-    p = await get_json(
-        session, "/api/v2/mix/market/long-short",
-        {"symbol": symbol, "period": "15m"}, True
-    )
+    global ls_last_call
+    # Bitget mendokumentasikan endpoint ini 1 request/detik/IP.
+    async with ls_lock:
+        wait = 1.02 - (time.monotonic() - ls_last_call)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        p = await get_json(
+            session, "/api/v2/mix/market/long-short",
+            {"symbol": symbol, "period": "15m"}, True
+        )
+        ls_last_call = time.monotonic()
     if not p:
         return None
     rows = p.get("data") or []
@@ -442,6 +457,7 @@ async def scan_spot(session, ticker):
 
 
 async def scan_futures(session, ticker):
+    """V900: breakout -> retest -> hold/reject state machine. Alert entry hanya dikirim ketika struktur sudah melakukan retest dan bertahan, bukan hanya karena harga baru menembus level. """
     sym = ticker["symbol"]
     fills, candles, book = await asyncio.gather(
         futures_fills(session, sym), futures_candles(session, sym), futures_book(session, sym)
@@ -454,134 +470,185 @@ async def scan_futures(session, ticker):
     dom = buy_dom if side == "LONG" else sell_dom
     if dom < MIN_FUT_DOM:
         return False
-
-    ls = await futures_long_short(session, sym)
-    await asyncio.sleep(1.02)
-
-    book_text = "N/A"
-    book_confirm = False
-    if book:
-        bid_r, ask_r = book
-        book_text = f"BID {bid_r:.0%} / ASK {ask_r:.0%}"
-        book_confirm = bid_r >= 0.57 if side == "LONG" else ask_r >= 0.57
-
-    ls_text = "N/A"
-    ls_confirm = False
-    if ls:
-        lr, sr, ratio = ls
-        ls_text = f"L {lr:.1%} / S {sr:.1%} / L:S {ratio:.2f}"
-        ls_confirm = ratio >= 1.08 if side == "LONG" else (ratio > 0 and ratio <= 0.92)
-
-    vol_confirm = candles["vol_ratio"] >= 1.35
-    structure_confirm = candles["breakout"] if side == "LONG" else candles["breakdown"]
-    momentum_confirm = (candles["ret15"] > 0 and candles["ret60"] > 0) if side == "LONG" else (candles["ret15"] < 0 and candles["ret60"] < 0)
-    trend_confirm = candles["trend_up"] if side == "LONG" else candles["trend_down"]
-    rsi_confirm = (52 <= candles["rsi"] <= 78) if side == "LONG" else (22 <= candles["rsi"] <= 48)
-    candle_confirm = candles["pattern"] in ({"BULLISH ENGULFING", "HAMMER"} if side == "LONG" else {"BEARISH ENGULFING", "SHOOTING STAR"})
-
     if side == "LONG" and ticker["change"] > MAX_PUMP:
-        return False
-
-    score = 0
-    score += 2 if dom >= 0.80 else 1
-    score += 1 if vol_confirm else 0
-    score += 2 if structure_confirm else 0
-    score += 1 if momentum_confirm else 0
-    score += 1 if trend_confirm else 0
-    score += 1 if rsi_confirm else 0
-    score += 1 if candle_confirm else 0
-    score += 1 if book_confirm else 0
-    score += 1 if ls_confirm else 0
-
-    independent = sum([momentum_confirm, trend_confirm, rsi_confirm, candle_confirm, book_confirm, ls_confirm])
-    if score < max(MIN_FUT_SCORE, 6) or not vol_confirm:
-        return False
-    if not structure_confirm and independent < 4:
-        return False
-
-    if score >= 9:
-        fut_tier, fut_icon = "STRONG", "🔥"
-    elif score >= 7:
-        fut_tier, fut_icon = "CONFIRMED", "✅"
-    else:
         return False
 
     price = ticker["price"]
     atr = candles.get("atr", 0.0) or price * 0.01
-    ema9 = candles["ema9"]
+    now = time.time()
 
-    # V800: entry adalah zona retest berbasis struktur + EMA9 + ATR, bukan harga saat alert semata.
+    # Bersihkan setup kadaluarsa.
+    for k, st in list(setup_state.items()):
+        if now - st.get("ts", now) > SETUP_TTL:
+            setup_state.pop(k, None)
+
+    # Deteksi breakout/breakdown baru dan simpan level yang harus diretest.
+    raw_break = candles["breakout"] if side == "LONG" else candles["breakdown"]
+    raw_level = candles["breakout_level"] if side == "LONG" else candles["breakdown_level"]
+    st = setup_state.get(sym)
+    if raw_break:
+        if not st or st.get("side") != side or abs(st.get("level", 0) - raw_level) > 0.35 * atr:
+            st = {"side": side, "level": raw_level, "ts": now, "phase": "BREAKOUT", "break_candle_ts": candles["candle_ts"]}
+            setup_state[sym] = st
+
+    # Jika flow berbalik sebelum retest, setup lama tidak dipaksakan.
+    if st and st.get("side") != side:
+        setup_state.pop(sym, None)
+        st = None
+
+    level = st.get("level") if st else raw_level
+    retest_touch = False
+    retest_hold = False
+    failed = False
+    if st:
+        is_later_candle = candles["candle_ts"] > st.get("break_candle_ts", 0)
+        if side == "LONG":
+            retest_touch = candles["low"] <= level + 0.30 * atr
+            retest_hold = is_later_candle and retest_touch and candles["close"] >= level + 0.05 * atr and candles["close"] >= candles["open"]
+            failed = candles["close"] < level - 0.25 * atr
+        else:
+            retest_touch = candles["high"] >= level - 0.30 * atr
+            retest_hold = is_later_candle and retest_touch and candles["close"] <= level - 0.05 * atr and candles["close"] <= candles["open"]
+            failed = candles["close"] > level + 0.25 * atr
+
+        if failed:
+            setup_state.pop(sym, None)
+            return False
+        if retest_hold:
+            st["phase"] = "RETEST_HOLD"
+        elif retest_touch:
+            st["phase"] = "RETEST_TESTING"
+        else:
+            st["phase"] = "WAIT_RETEST"
+
+    # V900 tidak mengirim entry pada breakout yang belum retest.
+    if not st or not retest_hold:
+        return False
+
+    book_text = "N/A"
+    book_confirm = False
+    book_available = book is not None
+    if book:
+        bid_r, ask_r = book
+        book_text = f"BID {bid_r:.0%} / ASK {ask_r:.0%}"
+        book_confirm = bid_r >= 0.54 if side == "LONG" else ask_r >= 0.54
+
+    vol_confirm = candles["vol_ratio"] >= 1.25
+    momentum_confirm = (candles["ret15"] > 0 and candles["ret60"] > 0) if side == "LONG" else (candles["ret15"] < 0 and candles["ret60"] < 0)
+    trend_confirm = candles["trend_up"] if side == "LONG" else candles["trend_down"]
+    slope_confirm = candles["ema9_slope"] > 0 and candles["ema21_slope"] >= 0 if side == "LONG" else candles["ema9_slope"] < 0 and candles["ema21_slope"] <= 0
+    rsi_confirm = (52 <= candles["rsi"] <= 72) if side == "LONG" else (28 <= candles["rsi"] <= 48)
+    candle_confirm = candles["pattern"] in ({"BULLISH ENGULFING", "HAMMER"} if side == "LONG" else {"BEARISH ENGULFING", "SHOOTING STAR"})
+
+    # Long/short dipanggil hanya setelah kandidat lolos gate murah, sehingga rate-limit 1/s tidak membebani 80 simbol.
+    cheap_confirms = sum([vol_confirm, momentum_confirm, trend_confirm, slope_confirm, rsi_confirm, candle_confirm, book_confirm])
+    if not vol_confirm or cheap_confirms < 4:
+        return False
+    ls = await futures_long_short(session, sym)
+
+    ls_text = "N/A"
+    ls_confirm = False
+    ls_available = ls is not None
+    if ls:
+        lr, sr, ratio = ls
+        ls_text = f"L {lr:.1%} / S {sr:.1%} / L:S {ratio:.2f}"
+        # Rasio ekstrem tidak otomatis dianggap bullish/bearish; hanya konfirmasi moderat.
+        ls_confirm = (1.03 <= ratio <= 2.50) if side == "LONG" else (0.40 <= ratio <= 0.97)
+
+    # Skor dinamis: denominator hanya menghitung data yang benar-benar tersedia.
+    score = 0
+    max_score = 0
+    max_score += 2; score += 2 if dom >= 0.80 else 1
+    max_score += 2; score += 2  # retest-hold wajib, jadi bobot terbesar setelah flow
+    for ok in [vol_confirm, momentum_confirm, trend_confirm, slope_confirm, rsi_confirm, candle_confirm]:
+        max_score += 1
+        score += int(ok)
+    if book_available:
+        max_score += 1; score += int(book_confirm)
+    if ls_available:
+        max_score += 1; score += int(ls_confirm)
+
+    confidence = score / max_score if max_score else 0.0
+    if confidence >= 0.84 and score >= 9:
+        fut_tier, fut_icon = "STRONG", "🔥"
+    elif confidence >= 0.72 and score >= 7:
+        fut_tier, fut_icon = "CONFIRMED", "✅"
+    else:
+        return False
+
+    # Zona entry berpusat pada level retest, bukan harga alert.
     if side == "LONG":
-        anchor = candles["breakout_level"] if candles["breakout"] else ema9
-        anchor = min(anchor, price)
-        entry_low = max(0.0, anchor - 0.20 * atr)
-        entry_high = min(price, anchor + 0.20 * atr)
-        if entry_high < entry_low:
-            entry_high = entry_low
+        entry_low = max(0.0, level - 0.18 * atr)
+        entry_high = level + 0.22 * atr
         entry = (entry_low + entry_high) / 2.0
-        structural_sl = min(candles["swing_low"], candles["support"])
-        raw_risk = entry - (structural_sl - 0.20 * atr)
-        risk = min(max(raw_risk, 0.80 * atr, entry * 0.004), 2.50 * atr)
+        structural_sl = min(candles["swing_low"], candles["support"], level - 0.55 * atr)
+        risk = max(entry - structural_sl, 0.85 * atr, entry * 0.004)
+        risk = min(risk, 2.50 * atr)
         sl = max(0.0, entry - risk)
         tp1, tp2, tp3 = entry + risk, entry + 2*risk, entry + 3*risk
-        chase = price > entry_high + 0.75 * atr
+        invalidation = level - 0.25 * atr
+        chase = price > entry_high + 0.60 * atr
     else:
-        anchor = candles["breakdown_level"] if candles["breakdown"] else ema9
-        anchor = max(anchor, price)
-        entry_low = max(price, anchor - 0.20 * atr)
-        entry_high = anchor + 0.20 * atr
+        entry_low = max(0.0, level - 0.22 * atr)
+        entry_high = level + 0.18 * atr
         entry = (entry_low + entry_high) / 2.0
-        structural_sl = max(candles["swing_high"], candles["resistance"])
-        raw_risk = (structural_sl + 0.20 * atr) - entry
-        risk = min(max(raw_risk, 0.80 * atr, entry * 0.004), 2.50 * atr)
+        structural_sl = max(candles["swing_high"], candles["resistance"], level + 0.55 * atr)
+        risk = max(structural_sl - entry, 0.85 * atr, entry * 0.004)
+        risk = min(risk, 2.50 * atr)
         sl = entry + risk
         tp1, tp2, tp3 = max(0.0, entry-risk), max(0.0, entry-2*risk), max(0.0, entry-3*risk)
-        chase = price < entry_low - 0.75 * atr
+        invalidation = level + 0.25 * atr
+        chase = price < entry_low - 0.60 * atr
 
     risk_pct = abs(sl / entry - 1.0) * 100 if entry > 0 else 0.0
-    strength = score + dom
+    strength = score + confidence
+    trend_text = "BULLISH" if candles["trend_up"] else "BEARISH" if candles["trend_down"] else "NETRAL"
 
     if chase:
-        fut_action = f"TUNGGU PULLBACK KE ZONA ENTRY, JANGAN KEJAR {side}"
-        entry_status = "HARGA SUDAH MENJAUH DARI ZONA IDEAL"
+        action = f"TUNGGU PULLBACK ULANG, JANGAN KEJAR {side}"
+        entry_status = "RETEST VALID, TETAPI HARGA SUDAH MENJAUH"
     else:
-        fut_action = f"PERTIMBANGKAN {side}" if fut_tier == "CONFIRMED" else f"KANDIDAT {side} KUAT"
-        entry_status = "HARGA MASIH DEKAT ZONA IDEAL"
+        action = f"ENTRY {side} VALID SETELAH RETEST" if fut_tier == "CONFIRMED" else f"SETUP {side} KUAT SETELAH RETEST"
+        entry_status = "RETEST BERHASIL DAN HARGA MASIH DEKAT ZONA"
 
-    fut_title = f"{'🔵' if side == 'LONG' else '🔴'} FUTURES: POTENSI {side} {fut_tier}"
-    trend_text = "BULLISH" if candles["trend_up"] else "BEARISH" if candles["trend_down"] else "NETRAL"
-    structure_text = "BREAKOUT" if candles["breakout"] else "BREAKDOWN" if candles["breakdown"] else "RANGE"
-
+    title = f"{'🟢' if side == 'LONG' else '🔴'} FUTURES: {side} RETEST {fut_tier}"
     msg = (
-        f"{fut_title}\n\n"
+        f"{title}\n\n"
         f"🪙 <b>{sym}</b>\n"
         f"💵 Harga sekarang: ${price:.8g}\n"
         f"📊 Perubahan 24J: {ticker['change']:+.2f}%\n"
         f"🔥 Turnover futures: {usd(ticker['turnover'])}\n"
         f"⚡ Dominasi transaksi agresif: <b>{dom:.1%}</b>\n"
-        f"🌋 Lonjakan volume 15m: <b>{candles['vol_ratio']:.2f}x</b>\n"
+        f"🌋 Volume 15m: <b>{candles['vol_ratio']:.2f}x</b> baseline\n"
         f"🧭 Momentum 15m / 60m: {candles['ret15']:+.2f}% / {candles['ret60']:+.2f}%\n"
-        f"🧱 Struktur: <b>{structure_text}</b>\n"
-        f"🕯 Pola candle: <b>{candles['pattern']}</b>\n"
+        f"🧱 Urutan struktur: <b>BREAK → RETEST → HOLD</b>\n"
+        f"📍 Level breakout/retest: <b>${level:.8g}</b>\n"
+        f"🕯 Pola candle retest: <b>{candles['pattern']}</b>\n"
         f"📈 EMA9 / EMA21: ${candles['ema9']:.8g} / ${candles['ema21']:.8g} | {trend_text}\n"
+        f"📐 Kemiringan EMA: {'SEARAH' if slope_confirm else 'BELUM SEARAH'}\n"
         f"📟 RSI14: <b>{candles['rsi']:.1f}</b>\n"
         f"🧲 Support / Resistance: ${candles['support']:.8g} / ${candles['resistance']:.8g}\n"
         f"📚 Order book: {book_text}\n"
         f"⚖️ Long/Short: {ls_text}\n"
         f"💸 Funding rate: {ticker['funding']:.6f}\n"
         f"📦 Open Interest: {ticker['oi']:.4g}\n"
-        f"{fut_icon} Keyakinan: <b>{fut_tier}</b> | skor <b>{score}/11</b>\n\n"
+        f"{fut_icon} Keyakinan: <b>{fut_tier}</b> | {confidence:.0%} | skor {score}/{max_score}\n\n"
         f"💰 <b>ZONA ENTRY: ${entry_low:.8g} - ${entry_high:.8g}</b>\n"
         f"📍 Entry acuan: ${entry:.8g}\n"
-        f"🛑 <b>SL: ${sl:.8g}</b> ({risk_pct:.2f}% dari entry acuan)\n"
+        f"🧨 Invalidation struktur: ${invalidation:.8g}\n"
+        f"🛑 <b>SL: ${sl:.8g}</b> ({risk_pct:.2f}% dari entry)\n"
         f"🎯 <b>TP1: ${tp1:.8g}</b> | R:R 1:1\n"
         f"🎯 <b>TP2: ${tp2:.8g}</b> | R:R 1:2\n"
         f"🏆 <b>TP3: ${tp3:.8g}</b> | R:R 1:3\n"
-        f"🚦 Status entry: <b>{entry_status}</b>\n\n"
-        f"🎯 <b>TINDAKAN: {fut_action}</b>\n"
-        f"ℹ️ Level memakai struktur candle, swing, EMA9 dan ATR 15m. Analisis saja, bukan eksekusi otomatis."
+        f"🚦 Status: <b>{entry_status}</b>\n\n"
+        f"🎯 <b>TINDAKAN: {action}</b>\n"
+        f"ℹ️ V900 menunggu retest-hold. Sinyal analisis, bukan eksekusi otomatis."
     )
-    return await send_once("futures", sym, side, strength, msg)
+    sent = await send_once("futures-v900", sym, side, strength, msg)
+    if sent:
+        # Hindari alert entry berulang untuk setup yang sama.
+        setup_state.pop(sym, None)
+    return sent
 
 
 
@@ -640,7 +707,7 @@ async def radar_loop():
     connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        print("🐋 CryptoBBSakti ALL-MARKET Radar V800 starting...")
+        print("🐋 CryptoBBSakti ALL-MARKET Radar V900 starting...")
 
         while True:
             started = time.time()
@@ -661,7 +728,7 @@ async def radar_loop():
 
                 if first_cycle:
                     print(
-                        f"RADAR V800 WARM-UP | SPOT baseline={spot_stage1} | "
+                        f"RADAR V900 WARM-UP | SPOT baseline={spot_stage1} | "
                         f"FUTURES baseline={fut_stage1} | alert dinonaktifkan pada siklus pertama"
                     )
                     await asyncio.sleep(CYCLE_SLEEP)
@@ -696,14 +763,14 @@ async def radar_loop():
                 top_fut = ",".join(x["symbol"] for x in fut_jobs[:3]) or "-"
 
                 print(
-                    f"RADAR V800 OK | "
+                    f"RADAR V900 OK | "
                     f"SPOT stage1={spot_stage1} deep={len(spot_jobs)} alerts={spot_alerts} "
                     f"top={top_spot} | "
                     f"FUTURES stage1={fut_stage1} deep={len(fut_jobs)} alerts={fut_alerts} "
                     f"top={top_fut} | {time.time()-started:.0f}s"
                 )
             except Exception as e:
-                print(f"RADAR V800 ERROR | {repr(e)}")
+                print(f"RADAR V900 ERROR | {repr(e)}")
 
             await asyncio.sleep(CYCLE_SLEEP)
 
@@ -712,7 +779,7 @@ async def health(_):
     return web.json_response({
         "ok": True,
         "service": "CryptoBBSakti ALL-MARKET Radar",
-        "version": "V800",
+        "version": "V900",
         "scope": "ALL Bitget USDT SPOT + USDT FUTURES",
         "dedup": len(seen),
         "time": int(time.time()),
@@ -733,7 +800,7 @@ async def main():
     await start_health()
     try:
         await tg.send(
-            "🐋 <b>CryptoBBSakti Radar V800 AKTIF</b>\n\n"
+            "🐋 <b>CryptoBBSakti Radar V900 AKTIF</b>\n\n"
             "✅ Semua koin Bitget USDT SPOT\n"
             "✅ Semua koin Bitget USDT FUTURES\n"
             "✅ BTC & ETH termasuk\n"
@@ -742,7 +809,8 @@ async def main():
             "🔬 Tahap 2 memeriksa kandidat anomali terkuat\n"
             "🎯 Telegram hanya: CONFIRMED / STRONG\n"
             "🕯 Futures memakai candle + EMA9/21 + RSI14 + struktur + ATR\n"
-            "🎯 Zona Entry + SL + TP1 + TP2 + TP3 dinamis\n"
+            "🧠 Futures wajib BREAK → candle berikutnya RETEST → HOLD\n"
+            "🎯 Zona Entry + invalidation + SL + TP1 + TP2 + TP3 dinamis\n"
             "🛡️ Siklus pertama digunakan untuk WARM-UP baseline\n"
             "📡 Mode analisis, tanpa eksekusi otomatis."
         )
