@@ -618,4 +618,16 @@ async def main():
             "✅ ALL Bitget USDT FUTURES coins\n"
             "✅ BTC & ETH INCLUDED\n"
             "🚫 No priority coin whitelist\n"
-  
+              "⚡ Stage 1 scans ALL tickers every cycle\n"
+            "🔬 Stage 2 deep-scans strongest anomalies\n"
+            "🎯 WATCH / CONFIRMED / STRONG confidence tiers\n"
+            "📡 Analysis-only mode."
+        )
+    except Exception as e:
+        print(f"TELEGRAM STARTUP WARNING | {repr(e)}")
+
+    await radar_loop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
