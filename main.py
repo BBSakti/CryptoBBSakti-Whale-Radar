@@ -612,7 +612,7 @@ async def radar_loop():
                 )
 
                 # STAGE 1: semua ticker dinilai setiap siklus.
-           first_cycle = not previous_spot and not previous_futures
+                first_cycle = not previous_spot and not previous_futures
                 spot_jobs, spot_stage1 = anomaly_rank(
                     spots, previous_spot, SPOT_FLOW_BUDGET
                 )
