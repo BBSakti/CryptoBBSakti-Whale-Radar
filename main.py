@@ -112,43 +112,49 @@ def make_key(symbol, side, event_ts):
 async def get_json(session, url, params=None):
 
     try:
-
         async with session.get(
             url,
             params=params
         ) as response:
 
+            raw = await response.text()
+
             if response.status != 200:
-
                 print(
-                    "HTTP ERROR",
-                    response.status,
-                    url
+                    f"HTTP DEBUG | "
+                    f"status={response.status} | "
+                    f"url={response.url} | "
+                    f"body={raw[:500]}"
                 )
-
                 return {}
 
-            payload = await response.json()
+            try:
+                payload = await response.json()
+            except Exception:
+                print(
+                    f"JSON ERROR | "
+                    f"url={response.url} | "
+                    f"body={raw[:500]}"
+                )
+                return {}
 
             if payload.get("code") != "00000":
-
                 print(
-                    "BITGET ERROR",
-                    payload.get("code"),
-                    payload.get("msg")
+                    f"BITGET ERROR | "
+                    f"url={response.url} | "
+                    f"code={payload.get('code')} | "
+                    f"msg={payload.get('msg')} | "
+                    f"body={raw[:500]}"
                 )
-
                 return {}
 
             return payload
 
     except Exception as err:
-
         print(
             "REQUEST ERROR:",
             repr(err)
         )
-
         return {}
 
 
