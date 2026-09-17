@@ -222,6 +222,13 @@ async def radar_loop():
                         fp = await r.json()
 
                     fills = fp.get("data") or []
+                    if not fills:
+                       print(
+                             f"FILLS DEBUG | {symbol} | "
+                             f"code={fp.get('code')} | "
+                             f"msg={fp.get('msg')} | "
+                             f"data={str(fp.get('data'))[:200]}"
+                            )
 
                     buy_usd = 0.0
                     sell_usd = 0.0
