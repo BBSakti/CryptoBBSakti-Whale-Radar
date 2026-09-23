@@ -462,7 +462,11 @@ async def scan_spot(session, ticker):
 
 
 async def scan_futures(session, ticker):
-    """V1000: breakout -> retest -> hold/reject state machine. Alert entry hanya dikirim ketika struktur sudah melakukan retest dan bertahan, bukan hanya karena harga baru menembus level. """
+    """V1000: breakout -> retest -> hold/reject state machine.
+
+    Alert entry hanya dikirim ketika struktur sudah melakukan retest dan bertahan,
+    bukan hanya karena harga baru menembus level.
+    """
     sym = ticker["symbol"]
     fills, candles, book = await asyncio.gather(
         futures_fills(session, sym), futures_candles(session, sym), futures_book(session, sym)
@@ -560,14 +564,307 @@ async def scan_futures(session, ticker):
         # Rasio ekstrem tidak otomatis dianggap bullish/bearish; hanya konfirmasi moderat.
         ls_confirm = (1.03 <= ratio <= 2.50) if side == "LONG" else (0.40 <= ratio <= 0.97)
 
-    # Skor dinamis: denominator hanya menghitung data yang benar-benar tersedia.
+        # Skor dinamis: denominator hanya menghitung data yang benar-benar tersedia.
     score = 0
     max_score = 0
     max_score += 2; score += 2 if dom >= 0.80 else 1
     max_score += 2; score += 2  # retest-hold wajib, jadi bobot terbesar setelah flow
     for ok in [vol_confirm, momentum_confirm, trend_confirm, slope_confirm, rsi_confirm, candle_confirm]:
         max_score += 1
-                "dedup": len(seen),
+        score += int(ok)
+    if book_available:
+        max_score += 1; score += int(book_confirm)
+    if ls_available:
+        max_score += 1; score += int(ls_confirm)
+
+    confidence = score / max_score if max_score else 0.0
+    if confidence >= 0.84 and score >= 9:
+        fut_tier, fut_icon = "STRONG", "🔥"
+    elif confidence >= 0.72 and score >= 7:
+        fut_tier, fut_icon = "CONFIRMED", "✅"
+    else:
+        return False
+
+    # Zona entry berpusat pada level retest, bukan harga alert.
+    if side == "LONG":
+        entry_low = max(0.0, level - 0.18 * atr)
+        entry_high = level + 0.22 * atr
+        entry = (entry_low + entry_high) / 2.0
+        structural_sl = min(candles["swing_low"], candles["support"], level - 0.55 * atr)
+        risk = max(entry - structural_sl, 0.85 * atr, entry * 0.004)
+        risk = min(risk, 2.50 * atr)
+        sl = max(0.0, entry - risk)
+        tp1, tp2, tp3 = entry + risk, entry + 2*risk, entry + 3*risk
+        invalidation = level - 0.25 * atr
+        chase = price > entry_high + 0.60 * atr
+    else:
+        entry_low = max(0.0, level - 0.22 * atr)
+        entry_high = level + 0.18 * atr
+        entry = (entry_low + entry_high) / 2.0
+        structural_sl = max(candles["swing_high"], candles["resistance"], level + 0.55 * atr)
+        risk = max(structural_sl - entry, 0.85 * atr, entry * 0.004)
+        risk = min(risk, 2.50 * atr)
+        sl = entry + risk
+        tp1, tp2, tp3 = max(0.0, entry-risk), max(0.0, entry-2*risk), max(0.0, entry-3*risk)
+        invalidation = level + 0.25 * atr
+        chase = price < entry_low - 0.60 * atr
+
+    risk_pct = abs(sl / entry - 1.0) * 100 if entry > 0 else 0.0
+    strength = score + confidence
+    trend_text = "BULLISH" if candles["trend_up"] else "BEARISH" if candles["trend_down"] else "NETRAL"
+
+    if chase:
+        action = f"TUNGGU PULLBACK ULANG, JANGAN KEJAR {side}"
+        entry_status = "RETEST VALID, TETAPI HARGA SUDAH MENJAUH"
+    else:
+        action = f"ENTRY {side} VALID SETELAH RETEST" if fut_tier == "CONFIRMED" else f"SETUP {side} KUAT SETELAH RETEST"
+        entry_status = "RETEST BERHASIL DAN HARGA MASIH DEKAT ZONA"
+
+    title = f"{'🟢' if side == 'LONG' else '🔴'} FUTURES: {side} RETEST {fut_tier}"
+    msg = (
+        f"{title}\n\n"
+        f"🪙 <b>{sym}</b>\n"
+        f"💵 Harga sekarang: ${price:.8g}\n"
+        f"📊 Perubahan 24J: {ticker['change']:+.2f}%\n"
+        f"🔥 Turnover futures: {usd(ticker['turnover'])}\n"
+        f"⚡ Dominasi transaksi agresif: <b>{dom:.1%}</b>\n"
+        f"🌋 Volume 15m: <b>{candles['vol_ratio']:.2f}x</b> baseline\n"
+        f"🧭 Momentum 15m / 60m: {candles['ret15']:+.2f}% / {candles['ret60']:+.2f}%\n"
+        f"🧱 Urutan struktur: <b>BREAK → RETEST → HOLD</b>\n"
+        f"📍 Level breakout/retest: <b>${level:.8g}</b>\n"
+        f"🕯 Pola candle retest: <b>{candles['pattern']}</b>\n"
+        f"📈 EMA9 / EMA21: ${candles['ema9']:.8g} / ${candles['ema21']:.8g} | {trend_text}\n"
+        f"📐 Kemiringan EMA: {'SEARAH' if slope_confirm else 'BELUM SEARAH'}\n"
+        f"📟 RSI14: <b>{candles['rsi']:.1f}</b>\n"
+        f"🧲 Support / Resistance: ${candles['support']:.8g} / ${candles['resistance']:.8g}\n"
+        f"📚 Order book: {book_text}\n"
+        f"⚖️ Long/Short: {ls_text}\n"
+        f"💸 Funding rate: {ticker['funding']:.6f}\n"
+        f"📦 Open Interest: {ticker['oi']:.4g}\n"
+        f"{fut_icon} Keyakinan: <b>{fut_tier}</b> | {confidence:.0%} | skor {score}/{max_score}\n\n"
+        f"💰 <b>ZONA ENTRY: ${entry_low:.8g} - ${entry_high:.8g}</b>\n"
+        f"📍 Entry acuan: ${entry:.8g}\n"
+        f"🧨 Invalidation struktur: ${invalidation:.8g}\n"
+        f"🛑 <b>SL: ${sl:.8g}</b> ({risk_pct:.2f}% dari entry)\n"
+        f"🎯 <b>TP1: ${tp1:.8g}</b> | R:R 1:1\n"
+        f"🎯 <b>TP2: ${tp2:.8g}</b> | R:R 1:2\n"
+        f"🏆 <b>TP3: ${tp3:.8g}</b> | R:R 1:3\n"
+        f"🚦 Status: <b>{entry_status}</b>\n\n"
+        f"🎯 <b>TINDAKAN: {action}</b>\n"
+        f"ℹ️ V1000 menunggu retest-hold. Sinyal analisis, bukan eksekusi otomatis."
+    )
+    sent = await send_once("futures-v900", sym, side, strength, msg)
+    if sent:
+        # Hindari alert entry berulang untuk setup yang sama.
+        setup_state.pop(sym, None)
+    return sent
+
+
+
+def anomaly_rank(items, previous, budget):
+    """
+    Stage 1 is market-wide and cheap: every ticker returned by Bitget is evaluated.
+    It ranks symbols by turnover acceleration, absolute price movement and liquidity.
+    Stage 2 then spends expensive API calls only on the strongest anomalies.
+    """
+    ranked = []
+    current = {}
+
+    for x in items:
+        sym = x["symbol"]
+        current[sym] = (x["price"], x["turnover"])
+        old = previous.get(sym)
+
+        turnover_accel = 1.0
+        short_move = 0.0
+        signed_move = 0.0
+        if old:
+            old_price, old_turn = old
+            if old_turn > 0:
+                turnover_accel = max(x["turnover"] / old_turn, 0.0)
+            if old_price > 0:
+                signed_move = (x["price"] / old_price - 1.0) * 100
+                short_move = abs(signed_move)
+
+        # First cycle has no baseline. Liquidity and 24h displacement provide
+        # the initial ranking; subsequent cycles add real short-term acceleration.
+        accel_component = min(max(turnover_accel - 1.0, 0.0) * 25.0, 25.0)
+        move_component = min(short_move * 8.0, 25.0)
+        day_component = min(abs(x["change"]) * 0.8, 20.0)
+        liquidity_component = min(max(__import__("math").log10(max(x["turnover"], 1)) - 5, 0) * 5, 15.0)
+        score = accel_component + move_component + day_component + liquidity_component
+
+        y = dict(x)
+        y["stage1_score"] = score
+        y["turnover_accel"] = turnover_accel
+        y["short_move"] = short_move
+        y["signed_move"] = signed_move
+        ranked.append(y)
+
+    previous.clear()
+    previous.update(current)
+    ranked.sort(key=lambda z: z["stage1_score"], reverse=True)
+    return ranked[:min(budget, len(ranked))], len(ranked), ranked
+
+
+
+async def scan_extreme_market(items, market):
+    """Fast market-wide extreme-move alert using ticker-to-ticker movement.
+
+    This runs before expensive deep scans, so a violent move can be reported even
+    when the symbol is not selected for the normal whale/retest analysis.
+    """
+    sent = 0
+    for x in items:
+        move = f(x.get("signed_move"))
+        day = f(x.get("change"))
+        magnitude = abs(move)
+        day_mag = abs(day)
+
+        # Avoid firing solely because a coin has been volatile earlier in the day.
+        # A large 24h displacement must still be moving now.
+        qualifies = (
+            magnitude >= EXTREME_MOVE_PCT or
+            (day_mag >= EXTREME_DAY_PCT and magnitude >= EXTREME_DAY_TRIGGER_MOVE)
+        )
+        if not qualifies:
+            continue
+
+        direction = "NAIK" if move > 0 else "TURUN"
+        bias = "LONG MOMENTUM" if move > 0 else "SHORT MOMENTUM"
+        if magnitude >= EXTREME_CRITICAL_MOVE_PCT:
+            level = "EKSTREM KRITIS"
+            icon = "🚨🚨"
+            strength = 3.0
+        elif magnitude >= EXTREME_MOVE_PCT:
+            level = "SANGAT VOLATIL"
+            icon = "🚨"
+            strength = 2.0
+        else:
+            level = "VOLATIL 24J + AKSELERASI"
+            icon = "⚠️"
+            strength = 1.0
+
+        # Do not present momentum direction as an entry recommendation.
+        action = (
+            "JANGAN KEJAR CANDLE. Tunggu pullback/retest dan konfirmasi V1000 sebelum entry."
+            if move > 0 else
+            "JANGAN KEJAR SHORT. Tunggu rebound/retest dan konfirmasi V1000 sebelum entry."
+        )
+        msg = (
+            f"{icon} <b>{market}: {level}</b>\n\n"
+            f"🪙 <b>{x['symbol']}</b>\n"
+            f"💵 Harga: ${x['price']:.10g}\n"
+            f"⚡ Gerak sejak siklus sebelumnya: <b>{move:+.2f}%</b>\n"
+            f"📊 Perubahan 24J: {day:+.2f}%\n"
+            f"🔥 Turnover 24J: {usd(x['turnover'])}\n"
+            f"🧭 Arah ekstrem: <b>{direction}</b> | radar: {bias}\n\n"
+            f"🎯 <b>TINDAKAN: {action}</b>\n"
+            f"ℹ️ Alert volatilitas cepat. Bukan sinyal entry otomatis; setup tetap harus lolos struktur, candle, volume dan retest."
+        )
+        if await send_once(f"extreme-{market.lower()}", x["symbol"], direction, strength, msg):
+            sent += 1
+    return sent
+
+def batch(items, cursor, budget):
+    if not items:
+        return [], 0
+    n = min(max(1, budget), len(items))
+    start = cursor % len(items)
+    chosen = [items[(start + i) % len(items)] for i in range(n)]
+    return chosen, (start + n) % len(items)
+
+
+async def radar_loop():
+    global spot_cursor, futures_cursor, previous_spot, previous_futures
+
+    timeout = aiohttp.ClientTimeout(total=20)
+    connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        print("🐋 CryptoBBSakti ALL-MARKET Radar V1000 starting...")
+
+        while True:
+            started = time.time()
+            try:
+                spots, futures = await asyncio.gather(
+                    spot_universe(session),
+                    futures_universe(session),
+                )
+
+                # STAGE 1: semua ticker dinilai setiap siklus.
+                first_cycle = not previous_spot and not previous_futures
+                spot_jobs, spot_stage1, spot_ranked = anomaly_rank(
+                    spots, previous_spot, SPOT_FLOW_BUDGET
+                )
+                fut_jobs, fut_stage1, fut_ranked = anomaly_rank(
+                    futures, previous_futures, FUTURES_BUDGET
+                )
+
+                if first_cycle:
+                    print(
+                        f"RADAR V1000 WARM-UP | SPOT baseline={spot_stage1} | "
+                        f"FUTURES baseline={fut_stage1} | alert dinonaktifkan pada siklus pertama"
+                    )
+                    await asyncio.sleep(CYCLE_SLEEP)
+                    continue
+
+                spot_alerts = fut_alerts = 0
+
+                # V1000 FAST LANE: scan every ticker for violent movement before
+                # the slower whale-flow / candle-retest deep analysis.
+                extreme_spot, extreme_fut = await asyncio.gather(
+                    scan_extreme_market(spot_ranked, "SPOT"),
+                    scan_extreme_market(fut_ranked, "FUTURES"),
+                )
+
+                # STAGE 2 SPOT: expensive whale-flow only for strongest anomalies.
+                for t in spot_jobs:
+                    try:
+                        spot_alerts += int(await scan_spot(session, t))
+                    except Exception as e:
+                        print(f"SPOT ERROR | {t['symbol']} | {repr(e)}")
+
+                # STAGE 2 FUTURES: multi-confirmation analysis for ranked anomalies.
+                sem = asyncio.Semaphore(8)
+
+                async def fut_worker(t):
+                    async with sem:
+                        try:
+                            return int(await scan_futures(session, t))
+                        except Exception as e:
+                            print(f"FUT ERROR | {t['symbol']} | {repr(e)}")
+                            return 0
+
+                if fut_jobs:
+                    fut_alerts = sum(
+                        await asyncio.gather(*(fut_worker(t) for t in fut_jobs))
+                    )
+
+                top_spot = ",".join(x["symbol"] for x in spot_jobs[:3]) or "-"
+                top_fut = ",".join(x["symbol"] for x in fut_jobs[:3]) or "-"
+
+                print(
+                    f"RADAR V1000 OK | "
+                    f"SPOT stage1={spot_stage1} deep={len(spot_jobs)} alerts={spot_alerts} "
+                    f"top={top_spot} | "
+                    f"FUTURES stage1={fut_stage1} deep={len(fut_jobs)} alerts={fut_alerts} "
+                    f"EXTREME spot={extreme_spot} futures={extreme_fut} "
+                    f"top={top_fut} | {time.time()-started:.0f}s"
+                )
+            except Exception as e:
+                print(f"RADAR V1000 ERROR | {repr(e)}")
+
+            await asyncio.sleep(CYCLE_SLEEP)
+
+
+async def health(_):
+    return web.json_response({
+        "ok": True,
+        "service": "CryptoBBSakti ALL-MARKET Radar",
+        "version": "V1000",
+        "scope": "ALL Bitget USDT SPOT + USDT FUTURES",
+        "dedup": len(seen),
         "time": int(time.time()),
     })
 
@@ -608,4 +905,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
